@@ -122,14 +122,20 @@ impl TaskControl {
         Ok(())
     }
 
-    pub(crate) fn drain_pending_steers(&self) -> Vec<UserMessage> {
-        self.inner
+    /// Drain steering as one operation ordered against cancellation.
+    ///
+    /// Holding the mailbox lock while observing cancellation means a steer is
+    /// either included in this batch or rejected/preceded by cancellation.
+    pub(crate) fn drain_pending_steers_unless_cancelled(&self) -> Option<Vec<UserMessage>> {
+        let mut mailbox = self
+            .inner
             .steering
             .lock()
-            .expect("steering mailbox poisoned")
-            .pending
-            .drain(..)
-            .collect()
+            .expect("steering mailbox poisoned");
+        if self.is_cancelled() {
+            return None;
+        }
+        Some(mailbox.pending.drain(..).collect())
     }
 
     /// Atomically close if empty. False means a steer linearized first.
@@ -201,7 +207,7 @@ mod tests {
         control.steer(UserMessage::new("one")).unwrap();
         control.steer(UserMessage::new("two")).unwrap();
         assert!(!control.close_if_empty());
-        let drained = control.drain_pending_steers();
+        let drained = control.drain_pending_steers_unless_cancelled().unwrap();
         assert_eq!(
             drained.iter().map(UserMessage::content).collect::<Vec<_>>(),
             ["one", "two"]

@@ -3,7 +3,6 @@ pub mod error;
 pub mod event;
 
 use std::borrow::Cow;
-use std::future::Future;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -22,6 +21,36 @@ pub struct Agent<P> {
     provider: P,
     tools: ToolExecutor,
     max_tool_rounds: Option<usize>,
+}
+
+/// Opaque provider continuation retained by an application across agent turns.
+///
+/// Create one with [`Agent::new_context`] and pass it to [`Agent::run_turn_in`].
+/// Its checkpoint advances only when the corresponding assistant message is
+/// accepted into the conversation.
+pub struct AgentContext<P: Provider> {
+    continuation: P::Continuation,
+}
+
+enum ContextSlot<'a, P: Provider> {
+    Owned(AgentContext<P>),
+    Borrowed(&'a mut AgentContext<P>),
+}
+
+impl<P: Provider> ContextSlot<'_, P> {
+    fn continuation(&self) -> &P::Continuation {
+        match self {
+            Self::Owned(context) => &context.continuation,
+            Self::Borrowed(context) => &context.continuation,
+        }
+    }
+
+    fn checkpoint(&mut self, continuation: P::Continuation) {
+        match self {
+            Self::Owned(context) => context.continuation = continuation,
+            Self::Borrowed(context) => context.continuation = continuation,
+        }
+    }
 }
 
 struct TurnGuard<'a> {
@@ -65,7 +94,14 @@ where
         self.tools.register(tool);
     }
 
-    /// Run one logical user turn with one provider-defined state value.
+    /// Create a fresh context which can retain provider continuation across turns.
+    pub fn new_context(&self, model: &P::Model) -> AgentContext<P> {
+        AgentContext {
+            continuation: self.provider.create_continuation(model),
+        }
+    }
+
+    /// Run one logical user turn with a fresh provider continuation.
     pub fn run_turn<'a>(
         &'a self,
         conversation: &'a mut Conversation,
@@ -78,13 +114,36 @@ where
                 Err(AgentError::ControlAlreadyUsed)
             }));
         }
-        let guard = TurnGuard { control };
         conversation.push_message(Message::User(user.with_steered(false)));
-        let state = self.provider.create_turn_state(model);
-        self.run_opened(conversation, model, control, state, guard)
+        let context = ContextSlot::Owned(self.new_context(model));
+        self.run_opened(conversation, model, control, context, TurnGuard { control })
     }
 
-    /// Compatibility entry point. Creates one state, but does not append a prompt.
+    /// Run one logical user turn in a retained provider context.
+    pub fn run_turn_in<'a>(
+        &'a self,
+        conversation: &'a mut Conversation,
+        model: &'a P::Model,
+        user: UserMessage,
+        context: &'a mut AgentContext<P>,
+        control: &'a TaskControl,
+    ) -> Task<'a, P::Error> {
+        if control.open().is_err() {
+            return Box::pin(futures::stream::once(async {
+                Err(AgentError::ControlAlreadyUsed)
+            }));
+        }
+        conversation.push_message(Message::User(user.with_steered(false)));
+        self.run_opened(
+            conversation,
+            model,
+            control,
+            ContextSlot::Borrowed(context),
+            TurnGuard { control },
+        )
+    }
+
+    /// Compatibility entry point. Uses a fresh continuation without appending a prompt.
     #[deprecated(note = "use run_turn; it explicitly starts a logical user turn")]
     pub fn run<'a>(
         &'a self,
@@ -97,9 +156,8 @@ where
                 Err(AgentError::ControlAlreadyUsed)
             }));
         }
-        let guard = TurnGuard { control };
-        let state = self.provider.create_turn_state(model);
-        self.run_opened(conversation, model, control, state, guard)
+        let context = ContextSlot::Owned(self.new_context(model));
+        self.run_opened(conversation, model, control, context, TurnGuard { control })
     }
 
     fn run_opened<'a>(
@@ -107,21 +165,23 @@ where
         conversation: &'a mut Conversation,
         model: &'a P::Model,
         control: &'a TaskControl,
-        state: P::TurnState,
+        context: ContextSlot<'a, P>,
         guard: TurnGuard<'a>,
     ) -> Task<'a, P::Error> {
         Box::pin(try_stream! {
-            // Keep this option so terminal paths can drop state before yielding.
-            let mut state = Some(state);
+            // Keep these options so terminal paths release retained state and
+            // close steering before yielding Completed.
+            let mut context = Some(context);
+            let mut guard = Some(guard);
             let vision_enabled = self.provider.supports_vision(model);
             let computer_use_enabled = self.provider.supports_computer_use(model);
             let tool_specs = self.tools.specs_for_capabilities(vision_enabled, computer_use_enabled);
             let mut tool_rounds_executed = 0;
 
             loop {
-                if control.is_cancelled() { Err(AgentError::Cancelled)?; }
-
-                for user in control.drain_pending_steers() {
+                let steers = control.drain_pending_steers_unless_cancelled()
+                    .ok_or(AgentError::Cancelled)?;
+                for user in steers {
                     conversation.push_message(Message::User(user.clone()));
                     yield AgentEvent::Steered(user);
                 }
@@ -132,37 +192,45 @@ where
                     Cow::Owned(conversation.without_images())
                 };
 
-                let message = {
-                    let completion = self.provider.complete_round(
-                        state.as_mut().expect("turn state exists"), model, &provider_input, &tool_specs,
+                let result = {
+                    let completion = self.provider.complete(
+                        context.as_ref().expect("agent context exists").continuation(),
+                        model,
+                        &provider_input,
+                        &tool_specs,
                     );
                     let cancellation = control.cancelled();
                     futures::pin_mut!(completion, cancellation);
-                    let result = futures::future::poll_fn(|cx| {
+                    futures::future::poll_fn(|cx| {
+                        // Cancellation wins when both become ready in one poll.
                         if cancellation.as_mut().poll(cx).is_ready() {
                             Poll::Ready(None)
                         } else {
                             completion.as_mut().poll(cx).map(Some)
                         }
-                    }).await;
-                    match result {
-                        Some(result) => {
-                            if control.is_cancelled() { Err(AgentError::Cancelled)?; }
-                            result.map_err(AgentError::Provider)?
-                        }
-                        None => Err(AgentError::Cancelled)?,
-                    }
+                    }).await
                 };
+
+                let (message, next_continuation) = match result {
+                    Some(Ok(completion)) if !control.is_cancelled() => completion,
+                    Some(Ok(_)) | None => Err(AgentError::Cancelled)?,
+                    Some(Err(error)) => Err(AgentError::Provider(error))?,
+                };
+
+                // The transcript and continuation are one logical checkpoint.
+                // No cancellation check occurs between these operations: once
+                // accepted, both survive cancellation racing immediately after.
                 let tool_calls = message.tool_calls().to_vec();
                 conversation.push_message(Message::Assistant(message.clone()));
+                context.as_mut().expect("agent context exists").checkpoint(next_continuation);
                 yield AgentEvent::AssistantReply(message.clone());
 
                 if tool_calls.is_empty() {
                     if !control.close_if_empty() {
                         continue;
                     }
-                    drop(state.take());
-                    drop(guard);
+                    drop(context.take());
+                    drop(guard.take());
                     yield AgentEvent::Completed(message);
                     return;
                 }

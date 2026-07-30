@@ -55,21 +55,21 @@ where
 {
     type Model = M;
     type Error = OpenAiError;
-    type TurnState = ();
+    type Continuation = ();
 
-    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+    fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
     fn supports_vision(&self, model: &M) -> bool {
         model.supports_vision()
     }
 
-    async fn complete_round(
+    async fn complete(
         &self,
-        _state: &mut Self::TurnState,
+        _continuation: &Self::Continuation,
         model: &M,
         conversation: &Conversation,
         tools: &[ToolSpec],
-    ) -> Result<AssistantMessage, Self::Error> {
+    ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
         completion::complete(
             &self.client,
             &self.chat_completions_url,
@@ -79,6 +79,7 @@ where
             tools,
         )
         .await
+        .map(|message| (message, ()))
     }
 }
 

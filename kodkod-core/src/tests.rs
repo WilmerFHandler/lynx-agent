@@ -82,9 +82,9 @@ struct RecordingProvider {
 impl Provider for RecordingProvider {
     type Model = TestModel;
     type Error = TestError;
-    type TurnState = ();
+    type Continuation = ();
 
-    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+    fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -94,19 +94,20 @@ impl Provider for RecordingProvider {
         model.computer_use()
     }
 
-    fn complete_round(
+    fn complete(
         &self,
-        _state: &mut Self::TurnState,
+        _state: &Self::Continuation,
         _model: &TestModel,
         _conversation: &Conversation,
         tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+    ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
+    {
         self.seen_tool_names
             .lock()
             .unwrap()
             .extend(tools.iter().map(|tool| tool.name().to_owned()));
 
-        ready(Ok(AssistantMessage::new("done")))
+        ready(Ok((AssistantMessage::new("done"), ())))
     }
 }
 
@@ -118,21 +119,22 @@ struct ToolCallingProvider {
 impl Provider for ToolCallingProvider {
     type Model = TestModel;
     type Error = TestError;
-    type TurnState = ();
+    type Continuation = ();
 
-    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+    fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
     }
 
-    fn complete_round(
+    fn complete(
         &self,
-        _state: &mut Self::TurnState,
+        _state: &Self::Continuation,
         _model: &TestModel,
         conversation: &Conversation,
         tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+    ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
+    {
         let call_count = self.calls.fetch_add(1, Ordering::SeqCst);
         assert!(tools.iter().any(|tool| tool.name() == "echo"));
 
@@ -141,16 +143,19 @@ impl Provider for ToolCallingProvider {
             .iter()
             .any(|message| matches!(message, Message::ToolResult(_)));
 
-        ready(Ok(if call_count == 0 {
-            AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
-                "call_1",
-                "echo",
-                json!({ "value": "hello" }),
-            )])
-        } else {
-            assert!(has_tool_result);
-            AssistantMessage::new("done")
-        }))
+        ready(Ok((
+            if call_count == 0 {
+                AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+                    "call_1",
+                    "echo",
+                    json!({ "value": "hello" }),
+                )])
+            } else {
+                assert!(has_tool_result);
+                AssistantMessage::new("done")
+            },
+            (),
+        )))
     }
 }
 
@@ -159,24 +164,30 @@ struct AlwaysToolCallingProvider;
 impl Provider for AlwaysToolCallingProvider {
     type Model = TestModel;
     type Error = TestError;
-    type TurnState = ();
+    type Continuation = ();
 
-    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+    fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
     }
 
-    fn complete_round(
+    fn complete(
         &self,
-        _state: &mut Self::TurnState,
+        _state: &Self::Continuation,
         _model: &TestModel,
         _conversation: &Conversation,
         _tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
-        ready(Ok(AssistantMessage::new("").with_tool_calls(vec![
-            ToolCall::new("call_1", "missing", json!({})),
-        ])))
+    ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
+    {
+        ready(Ok((
+            AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+                "call_1",
+                "missing",
+                json!({}),
+            )]),
+            (),
+        )))
     }
 }
 
@@ -438,36 +449,40 @@ struct TwoToolCallsProvider;
 impl Provider for TwoToolCallsProvider {
     type Model = TestModel;
     type Error = TestError;
-    type TurnState = ();
+    type Continuation = ();
 
-    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+    fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
     }
 
-    fn complete_round(
+    fn complete(
         &self,
-        _state: &mut Self::TurnState,
+        _state: &Self::Continuation,
         _model: &TestModel,
         conversation: &Conversation,
         _tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+    ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
+    {
         let has_tool_results = conversation
             .messages()
             .iter()
             .filter(|message| matches!(message, Message::ToolResult(_)))
             .count();
 
-        ready(Ok(if has_tool_results == 0 {
-            AssistantMessage::new("").with_tool_calls(vec![
-                ToolCall::new("call_1", "echo", json!({ "value": "a" })),
-                ToolCall::new("call_2", "echo", json!({ "value": "b" })),
-            ])
-        } else {
-            assert_eq!(has_tool_results, 2);
-            AssistantMessage::new("done")
-        }))
+        ready(Ok((
+            if has_tool_results == 0 {
+                AssistantMessage::new("").with_tool_calls(vec![
+                    ToolCall::new("call_1", "echo", json!({ "value": "a" })),
+                    ToolCall::new("call_2", "echo", json!({ "value": "b" })),
+                ])
+            } else {
+                assert_eq!(has_tool_results, 2);
+                AssistantMessage::new("done")
+            },
+            (),
+        )))
     }
 }
 
@@ -582,26 +597,27 @@ struct CapturingProvider {
 impl Provider for CapturingProvider {
     type Model = TestModel;
     type Error = TestError;
-    type TurnState = ();
+    type Continuation = ();
 
-    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+    fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
     }
 
-    fn complete_round(
+    fn complete(
         &self,
-        _state: &mut Self::TurnState,
+        _state: &Self::Continuation,
         _model: &TestModel,
         conversation: &Conversation,
         _tools: &[ToolSpec],
-    ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+    ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
+    {
         self.saw_images
             .lock()
             .unwrap()
             .push(conversation_has_images(conversation));
-        ready(Ok(AssistantMessage::new("ok")))
+        ready(Ok((AssistantMessage::new("ok"), ())))
     }
 }
 
@@ -714,21 +730,22 @@ fn steered_message_is_injected_between_rounds() {
     impl Provider for SteerAwareProvider {
         type Model = TestModel;
         type Error = TestError;
-        type TurnState = ();
+        type Continuation = ();
 
-        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+        fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete_round(
+        fn complete(
             &self,
-            _state: &mut Self::TurnState,
+            _state: &Self::Continuation,
             _model: &TestModel,
             conversation: &Conversation,
             tools: &[ToolSpec],
-        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+        ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
+        {
             let round = self.calls.fetch_add(1, Ordering::SeqCst);
             assert!(tools.iter().any(|tool| tool.name() == "echo"));
 
@@ -748,7 +765,7 @@ fn steered_message_is_injected_between_rounds() {
                 AssistantMessage::new(if found { "ack" } else { "missed" })
             };
 
-            ready(Ok(reply))
+            ready(Ok((reply, ())))
         }
     }
 
@@ -797,32 +814,36 @@ fn steer_events_are_emitted_in_order() {
     impl Provider for LoopingProvider {
         type Model = TestModel;
         type Error = TestError;
-        type TurnState = ();
+        type Continuation = ();
 
-        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+        fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete_round(
+        fn complete(
             &self,
-            _state: &mut Self::TurnState,
+            _state: &Self::Continuation,
             _model: &TestModel,
             _conversation: &Conversation,
             tools: &[ToolSpec],
-        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+        ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
+        {
             let round = self.calls.fetch_add(1, Ordering::SeqCst);
             assert!(tools.iter().any(|tool| tool.name() == "echo"));
-            ready(Ok(if round + 1 >= self.rounds {
-                AssistantMessage::new("done")
-            } else {
-                AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
-                    "call_1",
-                    "echo",
-                    json!({}),
-                )])
-            }))
+            ready(Ok((
+                if round + 1 >= self.rounds {
+                    AssistantMessage::new("done")
+                } else {
+                    AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+                        "call_1",
+                        "echo",
+                        json!({}),
+                    )])
+                },
+                (),
+            )))
         }
     }
 
@@ -888,24 +909,30 @@ fn cancel_takes_precedence_over_steer() {
     impl Provider for IdleProvider {
         type Model = TestModel;
         type Error = TestError;
-        type TurnState = ();
+        type Continuation = ();
 
-        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+        fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete_round(
+        fn complete(
             &self,
-            _state: &mut Self::TurnState,
+            _state: &Self::Continuation,
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
-        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
-            ready(Ok(AssistantMessage::new("").with_tool_calls(vec![
-                ToolCall::new("call_1", "echo", json!({})),
-            ])))
+        ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
+        {
+            ready(Ok((
+                AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+                    "call_1",
+                    "echo",
+                    json!({}),
+                )]),
+                (),
+            )))
         }
     }
 
@@ -952,7 +979,7 @@ fn cancel_interrupts_and_drops_in_flight_provider_future() {
     }
 
     impl Future for PendingCompletion {
-        type Output = Result<AssistantMessage, TestError>;
+        type Output = Result<(AssistantMessage, ()), TestError>;
 
         fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
             self.started.store(true, Ordering::SeqCst);
@@ -969,21 +996,22 @@ fn cancel_interrupts_and_drops_in_flight_provider_future() {
     impl Provider for PendingProvider {
         type Model = TestModel;
         type Error = TestError;
-        type TurnState = ();
+        type Continuation = ();
 
-        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+        fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete_round(
+        fn complete(
             &self,
-            _state: &mut Self::TurnState,
+            _state: &Self::Continuation,
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
-        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+        ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
+        {
             PendingCompletion {
                 started: Arc::clone(&self.started),
                 dropped: Arc::clone(&self.dropped),
@@ -1034,25 +1062,26 @@ fn cancellation_wins_when_provider_completes_in_the_same_poll() {
     impl Provider for CancellingProvider {
         type Model = TestModel;
         type Error = TestError;
-        type TurnState = ();
+        type Continuation = ();
 
-        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+        fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete_round(
+        fn complete(
             &self,
-            _state: &mut Self::TurnState,
+            _state: &Self::Continuation,
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
-        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+        ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
+        {
             let control = self.control.clone();
             async move {
                 control.cancel();
-                Ok(AssistantMessage::new("too late"))
+                Ok((AssistantMessage::new("too late"), ()))
             }
         }
     }
@@ -1089,7 +1118,7 @@ fn cancellation_during_completion_construction_prevents_provider_poll() {
     }
 
     impl Future for PollTrackingCompletion {
-        type Output = Result<AssistantMessage, TestError>;
+        type Output = Result<(AssistantMessage, ()), TestError>;
 
         fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
             self.polled.store(true, Ordering::SeqCst);
@@ -1100,21 +1129,22 @@ fn cancellation_during_completion_construction_prevents_provider_poll() {
     impl Provider for CancellingProvider {
         type Model = TestModel;
         type Error = TestError;
-        type TurnState = ();
+        type Continuation = ();
 
-        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+        fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete_round(
+        fn complete(
             &self,
-            _state: &mut Self::TurnState,
+            _state: &Self::Continuation,
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
-        ) -> impl Future<Output = Result<AssistantMessage, TestError>> + Send {
+        ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
+        {
             self.control.cancel();
             PollTrackingCompletion {
                 polled: Arc::clone(&self.polled),
@@ -1165,7 +1195,7 @@ fn drain_until_tool_finished(stream: &mut crate::Task<'_, TestError>) {
 }
 
 #[tokio::test]
-async fn run_turn_appends_prompt_once_creates_one_state_and_drops_before_completion() {
+async fn run_turn_creates_fresh_continuation_and_checkpoints_the_accepted_reply() {
     struct State {
         drops: Arc<AtomicUsize>,
     }
@@ -1181,29 +1211,34 @@ async fn run_turn_appends_prompt_once_creates_one_state_and_drops_before_complet
     impl Provider for StatefulProvider {
         type Model = TestModel;
         type Error = TestError;
-        type TurnState = State;
+        type Continuation = State;
 
         fn supports_vision(&self, _model: &Self::Model) -> bool {
             false
         }
-        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {
+        fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {
             self.creates.fetch_add(1, Ordering::SeqCst);
             State {
                 drops: Arc::clone(&self.drops),
             }
         }
-        async fn complete_round(
+        async fn complete(
             &self,
-            _state: &mut Self::TurnState,
+            _state: &Self::Continuation,
             _model: &Self::Model,
             conversation: &Conversation,
             _tools: &[ToolSpec],
-        ) -> Result<AssistantMessage, Self::Error> {
+        ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
             assert_eq!(conversation.messages().len(), 1);
             assert!(
                 matches!(&conversation.messages()[0], Message::User(user) if user.content() == "hello" && !user.steered())
             );
-            Ok(AssistantMessage::new("done"))
+            Ok((
+                AssistantMessage::new("done"),
+                State {
+                    drops: Arc::clone(&self.drops),
+                },
+            ))
         }
     }
 
@@ -1228,12 +1263,20 @@ async fn run_turn_appends_prompt_once_creates_one_state_and_drops_before_complet
         AgentEvent::AssistantReply(_)
     ));
     assert_eq!(creates.load(Ordering::SeqCst), 1);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "the prior checkpoint is replaced"
+    );
     assert!(matches!(
         task.next().await.unwrap().unwrap(),
         AgentEvent::Completed(_)
     ));
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        2,
+        "the fresh run owns its context"
+    );
     assert!(control.steer(UserMessage::new("late")).is_err());
     drop(task);
     assert_eq!(conversation.messages().len(), 2);
@@ -1251,20 +1294,20 @@ async fn abandoning_run_turn_drops_state_and_closes_steering() {
     impl Provider for PendingStateProvider {
         type Model = TestModel;
         type Error = TestError;
-        type TurnState = PendingState;
+        type Continuation = PendingState;
         fn supports_vision(&self, _: &Self::Model) -> bool {
             false
         }
-        fn create_turn_state(&self, _: &Self::Model) -> Self::TurnState {
+        fn create_continuation(&self, _: &Self::Model) -> Self::Continuation {
             PendingState(Arc::clone(&self.0))
         }
-        async fn complete_round(
+        async fn complete(
             &self,
-            _: &mut Self::TurnState,
+            _: &Self::Continuation,
             _: &Self::Model,
             _: &Conversation,
             _: &[ToolSpec],
-        ) -> Result<AssistantMessage, Self::Error> {
+        ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
             futures::future::pending().await
         }
     }
@@ -1287,4 +1330,155 @@ async fn abandoning_run_turn_drops_state_and_closes_steering() {
     drop(task);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert!(control.steer(UserMessage::new("late")).is_err());
+}
+
+#[tokio::test]
+async fn run_turn_in_retains_only_accepted_checkpoints_while_fresh_apis_reset() {
+    struct ContinuationProvider {
+        seen: Arc<Mutex<Vec<usize>>>,
+    }
+    impl Provider for ContinuationProvider {
+        type Model = TestModel;
+        type Error = TestError;
+        type Continuation = usize;
+
+        fn supports_vision(&self, _: &Self::Model) -> bool {
+            false
+        }
+        fn create_continuation(&self, _: &Self::Model) -> usize {
+            0
+        }
+        async fn complete(
+            &self,
+            continuation: &usize,
+            _: &Self::Model,
+            _: &Conversation,
+            _: &[ToolSpec],
+        ) -> Result<(AssistantMessage, usize), TestError> {
+            self.seen.lock().unwrap().push(*continuation);
+            Ok((
+                AssistantMessage::new(format!("checkpoint {continuation}")),
+                continuation + 1,
+            ))
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(ContinuationProvider {
+        seen: Arc::clone(&seen),
+    });
+    let model = TestModel::new();
+    let mut conversation = Conversation::new();
+    let mut context = agent.new_context(&model);
+
+    for prompt in ["one", "two"] {
+        let control = TaskControl::new();
+        let mut task = agent.run_turn_in(
+            &mut conversation,
+            &model,
+            UserMessage::new(prompt),
+            &mut context,
+            &control,
+        );
+        while task.next().await.is_some() {}
+    }
+
+    let control = TaskControl::new();
+    let mut fresh = agent.run_turn(
+        &mut conversation,
+        &model,
+        UserMessage::new("fresh"),
+        &control,
+    );
+    while fresh.next().await.is_some() {}
+    drop(fresh);
+
+    agent
+        .provider()
+        .complete_once(&model, &conversation, &[])
+        .await
+        .unwrap();
+    agent
+        .provider()
+        .complete_once(&model, &conversation, &[])
+        .await
+        .unwrap();
+    assert_eq!(*seen.lock().unwrap(), [0, 1, 0, 0, 0]);
+}
+
+#[tokio::test]
+async fn cancelled_completion_does_not_advance_retained_context() {
+    struct CancelsFirst {
+        seen: Arc<Mutex<Vec<usize>>>,
+        control: Arc<Mutex<Option<TaskControl>>>,
+    }
+    impl Provider for CancelsFirst {
+        type Model = TestModel;
+        type Error = TestError;
+        type Continuation = usize;
+
+        fn supports_vision(&self, _: &Self::Model) -> bool {
+            false
+        }
+        fn create_continuation(&self, _: &Self::Model) -> usize {
+            0
+        }
+        async fn complete(
+            &self,
+            continuation: &usize,
+            _: &Self::Model,
+            _: &Conversation,
+            _: &[ToolSpec],
+        ) -> Result<(AssistantMessage, usize), TestError> {
+            self.seen.lock().unwrap().push(*continuation);
+            if let Some(control) = self.control.lock().unwrap().take() {
+                control.cancel();
+            }
+            Ok((AssistantMessage::new("reply"), continuation + 1))
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let first_control = TaskControl::new();
+    let agent = Agent::new(CancelsFirst {
+        seen: Arc::clone(&seen),
+        control: Arc::new(Mutex::new(Some(first_control.clone()))),
+    });
+    let model = TestModel::new();
+    let mut conversation = Conversation::new();
+    let mut context = agent.new_context(&model);
+
+    let mut first = agent.run_turn_in(
+        &mut conversation,
+        &model,
+        UserMessage::new("first"),
+        &mut context,
+        &first_control,
+    );
+    assert!(matches!(
+        first.next().await.unwrap(),
+        Err(AgentError::Cancelled)
+    ));
+    drop(first);
+
+    let second_control = TaskControl::new();
+    let mut second = agent.run_turn_in(
+        &mut conversation,
+        &model,
+        UserMessage::new("second"),
+        &mut context,
+        &second_control,
+    );
+    while second.next().await.is_some() {}
+    drop(second);
+
+    assert_eq!(*seen.lock().unwrap(), [0, 0]);
+    assert_eq!(
+        conversation
+            .messages()
+            .iter()
+            .filter(|m| matches!(m, Message::Assistant(_)))
+            .count(),
+        1
+    );
 }

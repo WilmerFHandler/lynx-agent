@@ -38,14 +38,13 @@ impl<P> Provider for RetryProvider<P>
 where
     P: Provider + Sync,
     P::Error: Retryable,
-    P::TurnState: Clone,
 {
     type Model = P::Model;
     type Error = P::Error;
-    type TurnState = P::TurnState;
+    type Continuation = P::Continuation;
 
-    fn create_turn_state(&self, model: &Self::Model) -> Self::TurnState {
-        self.inner.create_turn_state(model)
+    fn create_continuation(&self, model: &Self::Model) -> Self::Continuation {
+        self.inner.create_continuation(model)
     }
 
     fn supports_vision(&self, model: &Self::Model) -> bool {
@@ -56,30 +55,24 @@ where
         self.inner.supports_computer_use(model)
     }
 
-    async fn complete_round(
+    async fn complete(
         &self,
-        state: &mut Self::TurnState,
+        continuation: &Self::Continuation,
         model: &Self::Model,
         conversation: &Conversation,
         tools: &[ToolSpec],
-    ) -> Result<AssistantMessage, Self::Error> {
+    ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
         let max = self.policy.max_attempts.max(1);
         let mut attempt = 0u32;
 
         loop {
             attempt += 1;
-            // Clone must be a logically independent snapshot. Shared interior
-            // mutability cannot provide rollback of local continuation state.
-            let mut attempt_state = state.clone();
             match self
                 .inner
-                .complete_round(&mut attempt_state, model, conversation, tools)
+                .complete(continuation, model, conversation, tools)
                 .await
             {
-                Ok(message) => {
-                    *state = attempt_state;
-                    return Ok(message);
-                }
+                Ok(completion) => return Ok(completion),
                 Err(error) if error.is_retryable() && attempt < max => {
                     futures_timer::Delay::new(self.policy.backoff_after_attempt(attempt)).await;
                 }
@@ -145,21 +138,22 @@ mod tests {
     impl Provider for FlakyProvider {
         type Model = TestModel;
         type Error = RetryTestError;
-        type TurnState = ();
+        type Continuation = ();
 
-        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+        fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete_round(
+        fn complete(
             &self,
-            _state: &mut Self::TurnState,
+            _state: &Self::Continuation,
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
-        ) -> impl Future<Output = Result<AssistantMessage, RetryTestError>> + Send {
+        ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), RetryTestError>> + Send
+        {
             let calls = Arc::clone(&self.calls);
             let fail_until = self.fail_until;
             async move {
@@ -167,7 +161,7 @@ mod tests {
                 if n <= fail_until {
                     Err(RetryTestError::http(503, true))
                 } else {
-                    Ok(AssistantMessage::new("ok"))
+                    Ok((AssistantMessage::new("ok"), ()))
                 }
             }
         }
@@ -205,21 +199,21 @@ mod tests {
         impl Provider for Once401 {
             type Model = TestModel;
             type Error = RetryTestError;
-            type TurnState = ();
+            type Continuation = ();
 
-            fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
+            fn create_continuation(&self, _model: &Self::Model) -> Self::Continuation {}
 
             fn supports_vision(&self, model: &TestModel) -> bool {
                 model.vision()
             }
 
-            async fn complete_round(
+            async fn complete(
                 &self,
-                _state: &mut Self::TurnState,
+                _state: &Self::Continuation,
                 _model: &TestModel,
                 _conversation: &Conversation,
                 _tools: &[ToolSpec],
-            ) -> Result<AssistantMessage, RetryTestError> {
+            ) -> Result<(AssistantMessage, Self::Continuation), RetryTestError> {
                 Err(RetryTestError::http(401, false))
             }
         }
@@ -287,38 +281,38 @@ mod transactional_tests {
         }
     }
 
-    struct MutatingProvider(Arc<AtomicUsize>);
-    impl Provider for MutatingProvider {
+    struct CheckpointProvider(Arc<AtomicUsize>);
+    impl Provider for CheckpointProvider {
         type Model = ();
         type Error = E;
-        type TurnState = usize;
+        type Continuation = usize;
         fn supports_vision(&self, _: &()) -> bool {
             false
         }
-        fn create_turn_state(&self, _: &()) -> usize {
-            0
+        fn create_continuation(&self, _: &()) -> usize {
+            7
         }
-        async fn complete_round(
+        async fn complete(
             &self,
-            state: &mut usize,
+            continuation: &usize,
             _: &(),
             _: &Conversation,
             _: &[ToolSpec],
-        ) -> Result<AssistantMessage, E> {
-            *state += 1;
+        ) -> Result<(AssistantMessage, usize), E> {
+            assert_eq!(*continuation, 7, "every retry sees the accepted checkpoint");
             let call = self.0.fetch_add(1, Ordering::SeqCst);
             if call < 2 {
                 Err(E)
             } else {
-                Ok(AssistantMessage::new("ok"))
+                Ok((AssistantMessage::new("ok"), 8))
             }
         }
     }
 
     #[tokio::test]
-    async fn failed_attempt_state_is_rolled_back_and_success_is_committed() {
+    async fn retries_delegate_the_checkpoint_and_return_the_successor() {
         let provider = RetryProvider::with_policy(
-            MutatingProvider(Arc::new(AtomicUsize::new(0))),
+            CheckpointProvider(Arc::new(AtomicUsize::new(0))),
             RetryPolicy {
                 max_attempts: 3,
                 initial_backoff: Duration::ZERO,
@@ -326,14 +320,11 @@ mod transactional_tests {
                 backoff_multiplier: 1.0,
             },
         );
-        let mut state = provider.create_turn_state(&());
-        provider
-            .complete_round(&mut state, &(), &Conversation::new(), &[])
+        let continuation = provider.create_continuation(&());
+        let (_, next) = provider
+            .complete(&continuation, &(), &Conversation::new(), &[])
             .await
             .unwrap();
-        assert_eq!(
-            state, 1,
-            "only the successful attempt snapshot is committed"
-        );
+        assert_eq!(next, 8);
     }
 }

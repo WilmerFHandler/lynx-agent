@@ -46,21 +46,23 @@ struct EchoProvider;
 impl Provider for EchoProvider {
     type Model = EchoModel;
     type Error = EchoError;
-    type TurnState = ();
+    type Continuation = ();
 
-    fn create_turn_state(&self, _model: &EchoModel) -> Self::TurnState {}
+    fn create_continuation(&self, _model: &EchoModel) -> Self::Continuation {}
 
     fn supports_vision(&self, _model: &EchoModel) -> bool {
         false
     }
 
-    fn complete_round(
+    fn complete(
         &self,
-        _state: &mut Self::TurnState,
+        _continuation: &Self::Continuation,
         _model: &EchoModel,
         conversation: &Conversation,
         _tools: &[ToolSpec],
-    ) -> impl std::future::Future<Output = Result<AssistantMessage, Self::Error>> + Send {
+    ) -> impl std::future::Future<
+        Output = Result<(AssistantMessage, Self::Continuation), Self::Error>,
+    > + Send {
         let content = conversation
             .messages()
             .iter()
@@ -71,7 +73,7 @@ impl Provider for EchoProvider {
             })
             .unwrap_or_else(|| "hello".to_owned());
 
-        ready(Ok(AssistantMessage::new(content)))
+        ready(Ok((AssistantMessage::new(content), ())))
     }
 }
 
