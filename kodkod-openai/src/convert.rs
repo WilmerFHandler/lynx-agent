@@ -5,9 +5,8 @@ use kodkod_core::{
 use serde_json::Value;
 
 use super::api::{
-    ChatCompletionRequest, ChatCompletionResponse, ContentPart, FunctionDefinition,
-    ImageUrl, RequestMessage, ToolCallKind, ToolDefinition, ToolDefinitionKind, UserContent,
-    WireToolCall,
+    ChatCompletionRequest, ChatCompletionResponse, ContentPart, FunctionDefinition, ImageUrl,
+    RequestMessage, ToolCallKind, ToolDefinition, ToolDefinitionKind, UserContent, WireToolCall,
 };
 use super::error::OpenAiError;
 
@@ -41,10 +40,7 @@ pub(crate) fn build_request(
                     && !output.images().is_empty()
                 {
                     let mut parts = vec![ContentPart::Text {
-                        text: format!(
-                            "Images returned by tool call '{}'.",
-                            result.tool_call_id()
-                        ),
+                        text: format!("Images returned by tool call '{}'.", result.tool_call_id()),
                     }];
                     parts.extend(output.images().iter().map(|image| ContentPart::ImageUrl {
                         image_url: ImageUrl {
@@ -84,10 +80,7 @@ pub(crate) fn parse_assistant_message(
         .ok_or(OpenAiError::EmptyResponse)?
         .message;
 
-    let content = message
-        .content
-        .or(message.refusal)
-        .unwrap_or_default();
+    let content = message.content.or(message.refusal).unwrap_or_default();
 
     let mut tool_calls: Vec<ToolCall> = message
         .tool_calls
@@ -254,10 +247,12 @@ mod tests {
 
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[1]["type"], "image_url");
-        assert!(parts[1]["image_url"]["url"]
-            .as_str()
-            .expect("url")
-            .starts_with("data:image/png;base64,"));
+        assert!(
+            parts[1]["image_url"]["url"]
+                .as_str()
+                .expect("url")
+                .starts_with("data:image/png;base64,")
+        );
     }
 
     #[test]

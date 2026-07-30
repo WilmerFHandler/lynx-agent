@@ -12,8 +12,12 @@ pub(crate) struct ChatCompletionRequest {
 #[derive(Debug, Serialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub(crate) enum RequestMessage {
-    System { content: String },
-    User { content: UserContent },
+    System {
+        content: String,
+    },
+    User {
+        content: UserContent,
+    },
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,

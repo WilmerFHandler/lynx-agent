@@ -60,21 +60,27 @@ mod tests {
 
     #[test]
     fn retryable_api_errors() {
-        assert!(OpenAiError::Api {
-            status: 429,
-            message: "rate limited".into(),
-        }
-        .is_retryable());
-        assert!(OpenAiError::Api {
-            status: 503,
-            message: "unavailable".into(),
-        }
-        .is_retryable());
-        assert!(!OpenAiError::Api {
-            status: 401,
-            message: "unauthorized".into(),
-        }
-        .is_retryable());
+        assert!(
+            OpenAiError::Api {
+                status: 429,
+                message: "rate limited".into(),
+            }
+            .is_retryable()
+        );
+        assert!(
+            OpenAiError::Api {
+                status: 503,
+                message: "unavailable".into(),
+            }
+            .is_retryable()
+        );
+        assert!(
+            !OpenAiError::Api {
+                status: 401,
+                message: "unauthorized".into(),
+            }
+            .is_retryable()
+        );
     }
 
     #[test]
