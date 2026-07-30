@@ -20,6 +20,15 @@ pub trait Provider: Sync {
     /// Create a fresh continuation.
     fn create_continuation(&self, model: &Self::Model) -> Self::Continuation;
 
+    /// Conservatively estimate private tokens replayed by this continuation.
+    ///
+    /// The default is appropriate for providers whose continuation does not add
+    /// request content. Implementations must not expose native contents while
+    /// calculating or reporting this value.
+    fn estimate_continuation_tokens(_continuation: &Self::Continuation) -> u64 {
+        0
+    }
+
     /// Produce one assistant response and its next continuation checkpoint.
     ///
     /// `continuation` is never modified in place. The caller accepts the returned

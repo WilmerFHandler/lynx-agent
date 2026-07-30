@@ -32,6 +32,13 @@ pub struct AgentContext<P: Provider> {
     continuation: P::Continuation,
 }
 
+impl<P: Provider> AgentContext<P> {
+    /// Conservatively estimate provider-private tokens replayed on the next request.
+    pub fn estimated_continuation_tokens(&self) -> u64 {
+        P::estimate_continuation_tokens(&self.continuation)
+    }
+}
+
 enum ContextSlot<'a, P: Provider> {
     Owned(AgentContext<P>),
     Borrowed(&'a mut AgentContext<P>),
