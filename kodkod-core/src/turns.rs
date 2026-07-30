@@ -1,4 +1,7 @@
-//! User turns as views over a flat message transcript.
+//! Structural user turns as views over a flat message transcript.
+//!
+//! These persisted transcript views are distinct from [`Provider::TurnState`](crate::Provider::TurnState),
+//! which is opaque execution state owned only for one [`Agent::run_turn`](crate::Agent::run_turn).
 
 use crate::{AssistantMessage, Message, UserMessage};
 

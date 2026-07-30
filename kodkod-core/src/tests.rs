@@ -1,3 +1,5 @@
+#![allow(deprecated, unused_must_use)]
+
 use std::error::Error;
 use std::fmt;
 use std::future::{Future, ready};
@@ -80,6 +82,9 @@ struct RecordingProvider {
 impl Provider for RecordingProvider {
     type Model = TestModel;
     type Error = TestError;
+    type TurnState = ();
+
+    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
@@ -89,8 +94,9 @@ impl Provider for RecordingProvider {
         model.computer_use()
     }
 
-    fn complete(
+    fn complete_round(
         &self,
+        _state: &mut Self::TurnState,
         _model: &TestModel,
         _conversation: &Conversation,
         tools: &[ToolSpec],
@@ -112,13 +118,17 @@ struct ToolCallingProvider {
 impl Provider for ToolCallingProvider {
     type Model = TestModel;
     type Error = TestError;
+    type TurnState = ();
+
+    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
     }
 
-    fn complete(
+    fn complete_round(
         &self,
+        _state: &mut Self::TurnState,
         _model: &TestModel,
         conversation: &Conversation,
         tools: &[ToolSpec],
@@ -149,13 +159,17 @@ struct AlwaysToolCallingProvider;
 impl Provider for AlwaysToolCallingProvider {
     type Model = TestModel;
     type Error = TestError;
+    type TurnState = ();
+
+    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
     }
 
-    fn complete(
+    fn complete_round(
         &self,
+        _state: &mut Self::TurnState,
         _model: &TestModel,
         _conversation: &Conversation,
         _tools: &[ToolSpec],
@@ -424,13 +438,17 @@ struct TwoToolCallsProvider;
 impl Provider for TwoToolCallsProvider {
     type Model = TestModel;
     type Error = TestError;
+    type TurnState = ();
+
+    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
     }
 
-    fn complete(
+    fn complete_round(
         &self,
+        _state: &mut Self::TurnState,
         _model: &TestModel,
         conversation: &Conversation,
         _tools: &[ToolSpec],
@@ -564,13 +582,17 @@ struct CapturingProvider {
 impl Provider for CapturingProvider {
     type Model = TestModel;
     type Error = TestError;
+    type TurnState = ();
+
+    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
     fn supports_vision(&self, model: &TestModel) -> bool {
         model.vision()
     }
 
-    fn complete(
+    fn complete_round(
         &self,
+        _state: &mut Self::TurnState,
         _model: &TestModel,
         conversation: &Conversation,
         _tools: &[ToolSpec],
@@ -692,13 +714,17 @@ fn steered_message_is_injected_between_rounds() {
     impl Provider for SteerAwareProvider {
         type Model = TestModel;
         type Error = TestError;
+        type TurnState = ();
+
+        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete(
+        fn complete_round(
             &self,
+            _state: &mut Self::TurnState,
             _model: &TestModel,
             conversation: &Conversation,
             tools: &[ToolSpec],
@@ -771,13 +797,17 @@ fn steer_events_are_emitted_in_order() {
     impl Provider for LoopingProvider {
         type Model = TestModel;
         type Error = TestError;
+        type TurnState = ();
+
+        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete(
+        fn complete_round(
             &self,
+            _state: &mut Self::TurnState,
             _model: &TestModel,
             _conversation: &Conversation,
             tools: &[ToolSpec],
@@ -858,13 +888,17 @@ fn cancel_takes_precedence_over_steer() {
     impl Provider for IdleProvider {
         type Model = TestModel;
         type Error = TestError;
+        type TurnState = ();
+
+        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete(
+        fn complete_round(
             &self,
+            _state: &mut Self::TurnState,
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
@@ -935,13 +969,17 @@ fn cancel_interrupts_and_drops_in_flight_provider_future() {
     impl Provider for PendingProvider {
         type Model = TestModel;
         type Error = TestError;
+        type TurnState = ();
+
+        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete(
+        fn complete_round(
             &self,
+            _state: &mut Self::TurnState,
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
@@ -996,13 +1034,17 @@ fn cancellation_wins_when_provider_completes_in_the_same_poll() {
     impl Provider for CancellingProvider {
         type Model = TestModel;
         type Error = TestError;
+        type TurnState = ();
+
+        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete(
+        fn complete_round(
             &self,
+            _state: &mut Self::TurnState,
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
@@ -1058,13 +1100,17 @@ fn cancellation_during_completion_construction_prevents_provider_poll() {
     impl Provider for CancellingProvider {
         type Model = TestModel;
         type Error = TestError;
+        type TurnState = ();
+
+        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete(
+        fn complete_round(
             &self,
+            _state: &mut Self::TurnState,
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
@@ -1116,4 +1162,129 @@ fn drain_until_tool_finished(stream: &mut crate::Task<'_, TestError>) {
         }
     }
     panic!("stream ended before a tool finished");
+}
+
+#[tokio::test]
+async fn run_turn_appends_prompt_once_creates_one_state_and_drops_before_completion() {
+    struct State {
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for State {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct StatefulProvider {
+        creates: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Provider for StatefulProvider {
+        type Model = TestModel;
+        type Error = TestError;
+        type TurnState = State;
+
+        fn supports_vision(&self, _model: &Self::Model) -> bool {
+            false
+        }
+        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            State {
+                drops: Arc::clone(&self.drops),
+            }
+        }
+        async fn complete_round(
+            &self,
+            _state: &mut Self::TurnState,
+            _model: &Self::Model,
+            conversation: &Conversation,
+            _tools: &[ToolSpec],
+        ) -> Result<AssistantMessage, Self::Error> {
+            assert_eq!(conversation.messages().len(), 1);
+            assert!(
+                matches!(&conversation.messages()[0], Message::User(user) if user.content() == "hello" && !user.steered())
+            );
+            Ok(AssistantMessage::new("done"))
+        }
+    }
+
+    let creates = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new(StatefulProvider {
+        creates: Arc::clone(&creates),
+        drops: Arc::clone(&drops),
+    });
+    let mut conversation = Conversation::new();
+    let control = TaskControl::new();
+    let model = TestModel::new();
+    let mut task = agent.run_turn(
+        &mut conversation,
+        &model,
+        UserMessage::new("hello").with_steered(true),
+        &control,
+    );
+
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::AssistantReply(_)
+    ));
+    assert_eq!(creates.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::Completed(_)
+    ));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(control.steer(UserMessage::new("late")).is_err());
+    drop(task);
+    assert_eq!(conversation.messages().len(), 2);
+}
+
+#[tokio::test]
+async fn abandoning_run_turn_drops_state_and_closes_steering() {
+    struct PendingState(Arc<AtomicUsize>);
+    impl Drop for PendingState {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct PendingStateProvider(Arc<AtomicUsize>);
+    impl Provider for PendingStateProvider {
+        type Model = TestModel;
+        type Error = TestError;
+        type TurnState = PendingState;
+        fn supports_vision(&self, _: &Self::Model) -> bool {
+            false
+        }
+        fn create_turn_state(&self, _: &Self::Model) -> Self::TurnState {
+            PendingState(Arc::clone(&self.0))
+        }
+        async fn complete_round(
+            &self,
+            _: &mut Self::TurnState,
+            _: &Self::Model,
+            _: &Conversation,
+            _: &[ToolSpec],
+        ) -> Result<AssistantMessage, Self::Error> {
+            futures::future::pending().await
+        }
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new(PendingStateProvider(Arc::clone(&drops)));
+    let mut conversation = Conversation::new();
+    let control = TaskControl::new();
+    let model = TestModel::new();
+    let mut task = agent.run_turn(
+        &mut conversation,
+        &model,
+        UserMessage::new("hello"),
+        &control,
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(1), task.next())
+            .await
+            .is_err()
+    );
+    drop(task);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(control.steer(UserMessage::new("late")).is_err());
 }

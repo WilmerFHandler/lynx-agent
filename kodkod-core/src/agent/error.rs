@@ -9,6 +9,8 @@ pub enum AgentError<E> {
     },
     /// The caller requested cancellation via [`TaskControl`](super::TaskControl).
     Cancelled,
+    /// The one-execution control was cancelled or previously used.
+    ControlAlreadyUsed,
 }
 
 impl<E> fmt::Display for AgentError<E>
@@ -22,6 +24,7 @@ where
                 write!(f, "assistant requested tools for more than {max} rounds")
             }
             Self::Cancelled => write!(f, "agent run was cancelled"),
+            Self::ControlAlreadyUsed => write!(f, "task control was cancelled or already used"),
         }
     }
 }
@@ -33,7 +36,7 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Provider(error) => Some(error),
-            Self::MaxToolRoundsExceeded { .. } | Self::Cancelled => None,
+            Self::MaxToolRoundsExceeded { .. } | Self::Cancelled | Self::ControlAlreadyUsed => None,
         }
     }
 }

@@ -46,13 +46,17 @@ struct EchoProvider;
 impl Provider for EchoProvider {
     type Model = EchoModel;
     type Error = EchoError;
+    type TurnState = ();
+
+    fn create_turn_state(&self, _model: &EchoModel) -> Self::TurnState {}
 
     fn supports_vision(&self, _model: &EchoModel) -> bool {
         false
     }
 
-    fn complete(
+    fn complete_round(
         &self,
+        _state: &mut Self::TurnState,
         _model: &EchoModel,
         conversation: &Conversation,
         _tools: &[ToolSpec],
@@ -75,11 +79,14 @@ impl Provider for EchoProvider {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = Agent::new(EchoProvider);
     let mut conversation = Conversation::new();
-    conversation.push_user_message(kodkod::UserMessage::new("hello"));
-
     let model = EchoModel;
     let control = TaskControl::new();
-    let mut stream = agent.run(&mut conversation, &model, &control);
+    let mut stream = agent.run_turn(
+        &mut conversation,
+        &model,
+        kodkod::UserMessage::new("hello"),
+        &control,
+    );
 
     while let Some(event) = stream.next().await {
         if let AgentEvent::Completed(message) = event? {

@@ -55,13 +55,17 @@ where
 {
     type Model = M;
     type Error = OpenAiError;
+    type TurnState = ();
+
+    fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
     fn supports_vision(&self, model: &M) -> bool {
         model.supports_vision()
     }
 
-    async fn complete(
+    async fn complete_round(
         &self,
+        _state: &mut Self::TurnState,
         model: &M,
         conversation: &Conversation,
         tools: &[ToolSpec],
@@ -130,7 +134,7 @@ mod tests {
             vision: false,
         };
         let message = provider
-            .complete(&model, &conversation, &[])
+            .complete_once(&model, &conversation, &[])
             .await
             .expect("completion should succeed");
 

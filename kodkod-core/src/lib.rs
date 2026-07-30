@@ -13,7 +13,7 @@ pub mod retry;
 pub mod tool;
 pub mod turns;
 
-pub use agent::{Agent, AgentError, AgentEvent, Task, TaskControl};
+pub use agent::{Agent, AgentError, AgentEvent, SteerError, Task, TaskControl};
 pub use conversation::Conversation;
 pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
 pub use provider::Provider;

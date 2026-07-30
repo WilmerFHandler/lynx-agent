@@ -38,9 +38,15 @@ impl<P> Provider for RetryProvider<P>
 where
     P: Provider + Sync,
     P::Error: Retryable,
+    P::TurnState: Clone,
 {
     type Model = P::Model;
     type Error = P::Error;
+    type TurnState = P::TurnState;
+
+    fn create_turn_state(&self, model: &Self::Model) -> Self::TurnState {
+        self.inner.create_turn_state(model)
+    }
 
     fn supports_vision(&self, model: &Self::Model) -> bool {
         self.inner.supports_vision(model)
@@ -50,8 +56,9 @@ where
         self.inner.supports_computer_use(model)
     }
 
-    async fn complete(
+    async fn complete_round(
         &self,
+        state: &mut Self::TurnState,
         model: &Self::Model,
         conversation: &Conversation,
         tools: &[ToolSpec],
@@ -61,8 +68,18 @@ where
 
         loop {
             attempt += 1;
-            match self.inner.complete(model, conversation, tools).await {
-                Ok(message) => return Ok(message),
+            // Clone must be a logically independent snapshot. Shared interior
+            // mutability cannot provide rollback of local continuation state.
+            let mut attempt_state = state.clone();
+            match self
+                .inner
+                .complete_round(&mut attempt_state, model, conversation, tools)
+                .await
+            {
+                Ok(message) => {
+                    *state = attempt_state;
+                    return Ok(message);
+                }
                 Err(error) if error.is_retryable() && attempt < max => {
                     futures_timer::Delay::new(self.policy.backoff_after_attempt(attempt)).await;
                 }
@@ -128,13 +145,17 @@ mod tests {
     impl Provider for FlakyProvider {
         type Model = TestModel;
         type Error = RetryTestError;
+        type TurnState = ();
+
+        fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
         fn supports_vision(&self, model: &TestModel) -> bool {
             model.vision()
         }
 
-        fn complete(
+        fn complete_round(
             &self,
+            _state: &mut Self::TurnState,
             _model: &TestModel,
             _conversation: &Conversation,
             _tools: &[ToolSpec],
@@ -171,7 +192,7 @@ mod tests {
         let model = TestModel;
         let conversation = Conversation::new();
         let message = provider
-            .complete(&model, &conversation, &[])
+            .complete_once(&model, &conversation, &[])
             .await
             .expect("should succeed after retries");
 
@@ -184,13 +205,17 @@ mod tests {
         impl Provider for Once401 {
             type Model = TestModel;
             type Error = RetryTestError;
+            type TurnState = ();
+
+            fn create_turn_state(&self, _model: &Self::Model) -> Self::TurnState {}
 
             fn supports_vision(&self, model: &TestModel) -> bool {
                 model.vision()
             }
 
-            async fn complete(
+            async fn complete_round(
                 &self,
+                _state: &mut Self::TurnState,
                 _model: &TestModel,
                 _conversation: &Conversation,
                 _tools: &[ToolSpec],
@@ -202,7 +227,7 @@ mod tests {
         let model = TestModel;
         let provider = RetryProvider::new(Once401);
         let err = provider
-            .complete(&model, &Conversation::new(), &[])
+            .complete_once(&model, &Conversation::new(), &[])
             .await
             .unwrap_err();
 
@@ -226,7 +251,7 @@ mod tests {
         );
         let model = TestModel;
         let conversation = Conversation::new();
-        let mut completion = Box::pin(provider.complete(&model, &conversation, &[]));
+        let mut completion = Box::pin(provider.complete_once(&model, &conversation, &[]));
 
         tokio::time::timeout(Duration::from_millis(5), completion.as_mut())
             .await
@@ -236,5 +261,79 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod transactional_tests {
+    use super::*;
+    use std::error::Error;
+    use std::fmt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct E;
+    impl fmt::Display for E {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("retry")
+        }
+    }
+    impl Error for E {}
+    impl Retryable for E {
+        fn is_retryable(&self) -> bool {
+            true
+        }
+    }
+
+    struct MutatingProvider(Arc<AtomicUsize>);
+    impl Provider for MutatingProvider {
+        type Model = ();
+        type Error = E;
+        type TurnState = usize;
+        fn supports_vision(&self, _: &()) -> bool {
+            false
+        }
+        fn create_turn_state(&self, _: &()) -> usize {
+            0
+        }
+        async fn complete_round(
+            &self,
+            state: &mut usize,
+            _: &(),
+            _: &Conversation,
+            _: &[ToolSpec],
+        ) -> Result<AssistantMessage, E> {
+            *state += 1;
+            let call = self.0.fetch_add(1, Ordering::SeqCst);
+            if call < 2 {
+                Err(E)
+            } else {
+                Ok(AssistantMessage::new("ok"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_attempt_state_is_rolled_back_and_success_is_committed() {
+        let provider = RetryProvider::with_policy(
+            MutatingProvider(Arc::new(AtomicUsize::new(0))),
+            RetryPolicy {
+                max_attempts: 3,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                backoff_multiplier: 1.0,
+            },
+        );
+        let mut state = provider.create_turn_state(&());
+        provider
+            .complete_round(&mut state, &(), &Conversation::new(), &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            state, 1,
+            "only the successful attempt snapshot is committed"
+        );
     }
 }
