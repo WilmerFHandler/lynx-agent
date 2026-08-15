@@ -110,9 +110,10 @@ let agent = Agent::new(RetryProvider::new(EchoProvider));
 ```
 
 `Conversation::estimate_tokens` is a tokenizer-free request-size heuristic.
-`Provider::compact` is a default method: it summarizes dropped prefix messages
-with `complete_once` and returns a new conversation that keeps the system prompt,
-the latest user plus later steers, and a recent protocol-safe tail.
+`Provider::compact` is a default method: it sends the dropped prefix (including
+any earlier summary) to `complete_once` and returns a new conversation that keeps
+the system prompt, the latest user plus later steers, and a recent protocol-safe
+tail.
 
 ## License
 

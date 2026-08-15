@@ -1,9 +1,41 @@
-You summarize conversation history for an agent that will continue from your summary.
+You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another coding agent that will resume the task.
 
-Write a concise third-person summary that preserves:
-- the user's goal and constraints
-- decisions and their rationale
-- current work and what remains
-- file paths, commands, identifiers, and errors that still matter
+The conversation above is what must be summarized. If it already contains an earlier summary, treat that as the starting point: keep still-true details, drop stale ones, and merge in what happened after.
 
-Do not continue the conversation. Do not offer to help. Output only the summary.
+Do not continue the work. Do not answer questions in the conversation. Output only the summary.
+
+Output exactly this Markdown structure and keep the section order:
+
+## Goal
+- [one or two sentences describing what the user is trying to accomplish]
+
+## Constraints & Preferences
+- [user constraints, preferences, or "(none)"]
+
+## Progress
+### Done
+- [finished work, or "(none)"]
+
+### In Progress
+- [current work, or "(none)"]
+
+### Blocked
+- [blockers, or "(none)"]
+
+## Key Decisions
+- [decision and why, or "(none)"]
+
+## Next Steps
+- [ordered next actions, or "(none)"]
+
+## Critical Context
+- [paths, commands, identifiers, errors, or "(none)"]
+
+## Relevant Files
+- [path: why it matters, or "(none)"]
+
+Rules:
+- Keep every section, even when empty.
+- Use terse bullets, not prose.
+- Preserve exact file paths, commands, error strings, and identifiers.
+- Do not mention that you are summarizing or compacting.

@@ -2,11 +2,11 @@ use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
 
-use crate::{AssistantMessage, Conversation, Message, Provider, ToolResultOutcome, UserMessage};
+use crate::{AssistantMessage, Conversation, Message, Provider, UserMessage};
 
 pub const DEFAULT_KEEP_TAIL_TOKENS: u64 = 20_000;
 
-const COMPACTION_SYSTEM: &str = include_str!("compact/prompt.txt");
+const COMPACTION_USER: &str = include_str!("compact/prompt.txt");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactOptions {
@@ -55,7 +55,10 @@ pub(crate) async fn run<P: Provider + ?Sized>(
 ) -> Result<Conversation, CompactError<P::Error>> {
     let kept = plan(conversation.messages(), options.keep_tail_tokens)
         .ok_or(CompactError::NothingToCompact)?;
-    let request = summarizer_conversation(conversation, &kept);
+    let request = summarizer_conversation(
+        conversation,
+        tail_starts_at(&kept, conversation.messages().len()),
+    );
     let message = provider
         .complete_once(model, &request, &[])
         .await
@@ -153,6 +156,18 @@ fn first_protocol_violation(messages: &[Message], start: usize) -> Option<usize>
     None
 }
 
+fn tail_starts_at(kept: &[usize], message_count: usize) -> usize {
+    let mut start = message_count;
+    for &index in kept.iter().rev() {
+        if index + 1 == start {
+            start = index;
+        } else {
+            break;
+        }
+    }
+    start
+}
+
 fn splice(conversation: &Conversation, kept: &[usize], summary: AssistantMessage) -> Conversation {
     let mut compacted = match conversation.system_prompt() {
         Some(prompt) => Conversation::new().with_system_prompt(prompt),
@@ -183,76 +198,16 @@ fn splice_messages(
     out
 }
 
-fn summarizer_conversation(conversation: &Conversation, kept: &[usize]) -> Conversation {
-    let messages = conversation.messages();
-    let mut body = String::new();
-
-    if let Some(system) = conversation.system_prompt() {
-        body.push_str("The agent system prompt is:\n");
-        body.push_str(system);
-        body.push_str("\n\n");
+fn summarizer_conversation(conversation: &Conversation, tail_starts_at: usize) -> Conversation {
+    let mut request = match conversation.system_prompt() {
+        Some(prompt) => Conversation::new().with_system_prompt(prompt),
+        None => Conversation::new(),
+    };
+    for message in &conversation.messages()[..tail_starts_at] {
+        request.push_message(message.clone());
     }
-
-    body.push_str("Conversation history to summarize:\n");
-    let mut dropped_any = false;
-    for (index, message) in messages.iter().enumerate() {
-        if kept.binary_search(&index).is_ok() {
-            continue;
-        }
-        dropped_any = true;
-        body.push_str(&serialize_message(message));
-        body.push('\n');
-    }
-    if !dropped_any {
-        body.push_str("(none)\n");
-    }
-
-    let pinned = pinned_indices(messages);
-    if !pinned.is_empty() {
-        body.push_str(
-            "\nThe following user instructions remain verbatim outside the summary. \
-             Use them only to interpret the summarized work; do not claim they were \
-             completed unless the history shows that.\n",
-        );
-        for index in pinned {
-            body.push_str(&serialize_message(&messages[index]));
-            body.push('\n');
-        }
-    }
-
-    let mut request = Conversation::new().with_system_prompt(COMPACTION_SYSTEM.trim());
-    request.push_user_message(UserMessage::new(body));
+    request.push_user_message(UserMessage::new(COMPACTION_USER.trim()));
     request
-}
-
-fn serialize_message(message: &Message) -> String {
-    match message {
-        Message::System(system) => format!("system: {}", system.content()),
-        Message::User(user) if user.steered() => format!("steer: {}", user.content()),
-        Message::User(user) => format!("user: {}", user.content()),
-        Message::Assistant(assistant) => {
-            let mut out = format!("assistant: {}", assistant.content());
-            for call in assistant.tool_calls() {
-                let args = serde_json::to_string(call.arguments()).unwrap_or_else(|_| "{}".into());
-                out.push('\n');
-                out.push_str(&format!(
-                    "assistant tool_call id={} name={} args={args}",
-                    call.id(),
-                    call.name(),
-                ));
-            }
-            out
-        }
-        Message::ToolResult(result) => match result.outcome() {
-            ToolResultOutcome::Success(output) => {
-                let value = serde_json::to_string(output.value()).unwrap_or_else(|_| "null".into());
-                format!("tool_result id={} success={value}", result.tool_call_id())
-            }
-            ToolResultOutcome::Error(error) => {
-                format!("tool_result id={} error={error}", result.tool_call_id())
-            }
-        },
-    }
 }
 
 #[cfg(test)]
@@ -513,11 +468,21 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0, 0);
         assert_ne!(seen[0].1, conversation);
-        assert_eq!(seen[0].1.system_prompt(), Some(COMPACTION_SYSTEM.trim()));
-        assert_eq!(seen[0].1.messages().len(), 1);
+        assert_eq!(seen[0].1.system_prompt(), Some("be helpful"));
+        let request = seen[0].1.messages();
+        assert!(
+            request
+                .iter()
+                .any(|message| matches!(message, Message::User(u) if u.content() == "old task"))
+        );
+        assert!(
+            !request
+                .iter()
+                .any(|message| matches!(message, Message::Assistant(a) if a.content() == "recent"))
+        );
         assert!(matches!(
-            seen[0].1.messages().first(),
-            Some(Message::User(_))
+            request.last(),
+            Some(Message::User(user)) if user.content() == COMPACTION_USER.trim()
         ));
 
         assert_eq!(compacted.system_prompt(), Some("be helpful"));
@@ -548,6 +513,35 @@ mod tests {
                 .messages()
                 .iter()
                 .any(|message| matches!(message, Message::User(u) if u.content() == "old task"))
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_sends_an_existing_summary_as_a_normal_message() {
+        let provider = FakeProvider::new(Ok("SUM".into()));
+        let mut conversation = Conversation::new();
+        conversation.push_message(Message::Assistant(AssistantMessage::new("old summary")));
+        conversation.push_message(Message::User(UserMessage::new("more work")));
+        conversation.push_message(Message::Assistant(AssistantMessage::new("x".repeat(300))));
+        conversation.push_message(Message::User(UserMessage::new("latest")));
+        conversation.push_message(Message::Assistant(AssistantMessage::new("recent")));
+
+        let _ = provider
+            .compact(&(), &conversation, last_message_tail(&conversation))
+            .await
+            .unwrap();
+
+        let seen = provider.seen.lock().unwrap();
+        assert!(matches!(
+            seen[0].1.messages().first(),
+            Some(Message::Assistant(a)) if a.content() == "old summary"
+        ));
+        assert!(
+            !seen[0]
+                .1
+                .messages()
+                .iter()
+                .any(|message| matches!(message, Message::Assistant(a) if a.content() == "recent"))
         );
     }
 
