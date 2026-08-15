@@ -192,6 +192,13 @@ pub enum Message {
     ToolResult(ToolResult),
 }
 
+impl Message {
+    /// Tokenizer-free estimate of this message, including framing overhead.
+    pub fn estimate_tokens(&self) -> u64 {
+        crate::estimate::estimate_message(self)
+    }
+}
+
 mod base64_bytes {
     use super::*;
 

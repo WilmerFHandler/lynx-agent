@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
 
-use crate::estimate::estimate_message;
 use crate::{AssistantMessage, Conversation, Message, Provider, ToolResultOutcome, UserMessage};
 
 pub const DEFAULT_KEEP_TAIL_TOKENS: u64 = 20_000;
@@ -76,7 +75,7 @@ fn plan(messages: &[Message], keep_tail_tokens: u64) -> Option<Vec<usize>> {
     let mut tail_starts_at = messages.len();
     let mut tail_tokens = 0_u64;
     while tail_starts_at > 0 {
-        let next = estimate_message(&messages[tail_starts_at - 1]);
+        let next = messages[tail_starts_at - 1].estimate_tokens();
         if next > keep_tail_tokens.saturating_sub(tail_tokens) {
             break;
         }
@@ -288,7 +287,7 @@ mod tests {
             Message::User(UserMessage::new("latest instructions")),
             Message::Assistant(AssistantMessage::new("recent answer")),
         ];
-        let budget = estimate_message(&messages[3]);
+        let budget = messages[3].estimate_tokens();
         assert_eq!(plan(&messages, budget), Some(vec![2, 3]));
     }
 
@@ -317,7 +316,7 @@ mod tests {
             Message::ToolResult(ToolResult::success("call-1", json!("result"))),
             Message::Assistant(AssistantMessage::new("done")),
         ];
-        let budget = estimate_message(&messages[2]) + estimate_message(&messages[3]);
+        let budget = messages[2].estimate_tokens() + messages[3].estimate_tokens();
         assert_eq!(plan(&messages, budget), Some(vec![0, 3]));
     }
 
@@ -346,7 +345,7 @@ mod tests {
             Message::User(UserMessage::new("new")),
             Message::Assistant(AssistantMessage::new("recent")),
         ];
-        let budget = estimate_message(&messages[2]) + estimate_message(&messages[3]);
+        let budget = messages[2].estimate_tokens() + messages[3].estimate_tokens();
         let kept = plan(&messages, budget).unwrap();
         assert_eq!(kept, vec![2, 3]);
         let spliced = splice_messages(&messages, &kept, AssistantMessage::new("SUM"));
@@ -495,7 +494,7 @@ mod tests {
 
     fn last_message_tail(conversation: &Conversation) -> CompactOptions {
         CompactOptions {
-            keep_tail_tokens: estimate_message(conversation.messages().last().unwrap()),
+            keep_tail_tokens: conversation.messages().last().unwrap().estimate_tokens(),
         }
     }
 
