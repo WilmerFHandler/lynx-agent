@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::future::Future;
 
+use crate::compact::{CompactError, CompactOptions};
 use crate::{AssistantMessage, Conversation, ToolSpec};
 
 /// A model provider with an opaque, checkpointed continuation value.
@@ -55,5 +56,19 @@ pub trait Provider: Sync {
                 .await
                 .map(|(message, _)| message)
         }
+    }
+
+    /// Summarize dropped prefix messages and return a smaller conversation.
+    ///
+    /// The default implementation is provider-agnostic: it plans a protocol-safe
+    /// tail, asks `complete_once` for a summary, and splices that summary into a
+    /// new conversation. The original conversation is not modified.
+    fn compact(
+        &self,
+        model: &Self::Model,
+        conversation: &Conversation,
+        options: CompactOptions,
+    ) -> impl Future<Output = Result<Conversation, CompactError<Self::Error>>> + Send {
+        async move { crate::compact::run(self, model, conversation, options).await }
     }
 }

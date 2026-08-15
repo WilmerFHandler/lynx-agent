@@ -13,7 +13,11 @@ pub mod retry;
 pub mod tool;
 pub mod turns;
 
+mod compact;
+mod estimate;
+
 pub use agent::{Agent, AgentContext, AgentError, AgentEvent, SteerError, Task, TaskControl};
+pub use compact::{CompactError, CompactOptions, DEFAULT_KEEP_TAIL_TOKENS};
 pub use conversation::Conversation;
 pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
 pub use provider::Provider;

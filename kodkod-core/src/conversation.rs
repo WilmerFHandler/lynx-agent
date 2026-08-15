@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Message, UserMessage};
+use crate::{Message, ToolSpec, UserMessage};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conversation {
@@ -24,6 +24,14 @@ impl Conversation {
 
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Tokenizer-free estimate of the tokens this conversation would send.
+    ///
+    /// Pass `&[]` when tools are not part of the request. Continuation tokens
+    /// are not included; add `Provider::estimate_continuation_tokens` separately.
+    pub fn estimate_tokens(&self, tools: &[ToolSpec]) -> u64 {
+        crate::estimate::estimate_conversation(self, tools)
     }
 
     /// User turns as views over this conversation's messages.
