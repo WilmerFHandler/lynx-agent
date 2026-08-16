@@ -18,6 +18,13 @@ pub struct CompactOptions {
     pub keep_tail_tokens: u64,
 }
 
+/// Per-turn compaction settings. The model may differ from the turn model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnCompaction<M> {
+    pub model: M,
+    pub options: CompactOptions,
+}
+
 impl Default for CompactOptions {
     fn default() -> Self {
         Self {

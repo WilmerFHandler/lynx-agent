@@ -24,6 +24,7 @@ struct SteeringMailbox {
 #[derive(Debug)]
 struct TaskControlInner {
     cancelled: AtomicBool,
+    compact_requested: AtomicBool,
     cancellation: Event,
     steering: Mutex<SteeringMailbox>,
 }
@@ -61,6 +62,7 @@ impl TaskControl {
         Self {
             inner: Arc::new(TaskControlInner {
                 cancelled: AtomicBool::new(false),
+                compact_requested: AtomicBool::new(false),
                 cancellation: Event::new(),
                 steering: Mutex::new(SteeringMailbox {
                     admission: Admission::Fresh,
@@ -79,6 +81,18 @@ impl TaskControl {
 
     pub fn is_cancelled(&self) -> bool {
         self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Request compaction at the next round boundary.
+    ///
+    /// The flag is one-shot: the agent consumes it before the next `complete`.
+    /// A request after the turn has closed is ignored.
+    pub fn request_compact(&self) {
+        self.inner.compact_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_compact_request(&self) -> bool {
+        self.inner.compact_requested.swap(false, Ordering::SeqCst)
     }
 
     pub async fn cancelled(&self) {
@@ -222,5 +236,15 @@ mod tests {
                 .content(),
             "late"
         );
+    }
+
+    #[test]
+    fn compact_request_is_taken_once() {
+        let control = TaskControl::new();
+        assert!(!control.take_compact_request());
+        control.request_compact();
+        control.request_compact();
+        assert!(control.take_compact_request());
+        assert!(!control.take_compact_request());
     }
 }

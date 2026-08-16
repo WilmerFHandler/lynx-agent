@@ -3,6 +3,7 @@ pub mod error;
 pub mod event;
 
 use std::borrow::Cow;
+use std::future::Future;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -15,7 +16,22 @@ pub use event::AgentEvent;
 /// Streaming events from an [`Agent::run_turn`] call.
 pub type Task<'a, E> = futures::stream::BoxStream<'a, Result<AgentEvent, AgentError<E>>>;
 
-use crate::{Conversation, Message, Provider, Tool, ToolExecutor, UserMessage};
+use crate::{
+    CompactError, Conversation, Message, Provider, Tool, ToolExecutor, TurnCompaction, UserMessage,
+};
+
+async fn cancel_or<T>(control: &TaskControl, operation: impl Future<Output = T>) -> Option<T> {
+    let cancellation = control.cancelled();
+    futures::pin_mut!(operation, cancellation);
+    futures::future::poll_fn(|cx| {
+        if cancellation.as_mut().poll(cx).is_ready() {
+            Poll::Ready(None)
+        } else {
+            operation.as_mut().poll(cx).map(Some)
+        }
+    })
+    .await
+}
 
 pub struct Agent<P> {
     provider: P,
@@ -123,7 +139,14 @@ where
         }
         conversation.push_message(Message::User(user.with_steered(false)));
         let context = ContextSlot::Owned(self.new_context(model));
-        self.run_opened(conversation, model, control, context, TurnGuard { control })
+        self.run_opened(
+            conversation,
+            model,
+            control,
+            context,
+            None,
+            TurnGuard { control },
+        )
     }
 
     /// Run one logical user turn in a retained provider context.
@@ -134,6 +157,7 @@ where
         user: UserMessage,
         context: &'a mut AgentContext<P>,
         control: &'a TaskControl,
+        compaction: Option<TurnCompaction<&'a P::Model>>,
     ) -> Task<'a, P::Error> {
         if control.open().is_err() {
             return Box::pin(futures::stream::once(async {
@@ -146,6 +170,7 @@ where
             model,
             control,
             ContextSlot::Borrowed(context),
+            compaction,
             TurnGuard { control },
         )
     }
@@ -164,7 +189,14 @@ where
             }));
         }
         let context = ContextSlot::Owned(self.new_context(model));
-        self.run_opened(conversation, model, control, context, TurnGuard { control })
+        self.run_opened(
+            conversation,
+            model,
+            control,
+            context,
+            None,
+            TurnGuard { control },
+        )
     }
 
     fn run_opened<'a>(
@@ -173,6 +205,7 @@ where
         model: &'a P::Model,
         control: &'a TaskControl,
         context: ContextSlot<'a, P>,
+        compaction: Option<TurnCompaction<&'a P::Model>>,
         guard: TurnGuard<'a>,
     ) -> Task<'a, P::Error> {
         Box::pin(try_stream! {
@@ -193,30 +226,55 @@ where
                     yield AgentEvent::Steered(user);
                 }
 
+                if let Some(compaction) = compaction.filter(|_| control.take_compact_request()) {
+                    yield AgentEvent::CompactionStarted;
+                    let result = match cancel_or(
+                        control,
+                        self.provider.compact(
+                            compaction.model,
+                            conversation,
+                            compaction.options,
+                        ),
+                    )
+                    .await
+                    {
+                        Some(result) if !control.is_cancelled() => result,
+                        _ => Err(AgentError::Cancelled)?,
+                    };
+                    match result {
+                        Ok(compacted) => {
+                            // Conversation and continuation are one checkpoint.
+                            *conversation = compacted.clone();
+                            context
+                                .as_mut()
+                                .expect("agent context exists")
+                                .checkpoint(self.provider.create_continuation(model));
+                            yield AgentEvent::Compacted(compacted);
+                        }
+                        Err(CompactError::NothingToCompact) => {}
+                        Err(error) => {
+                            yield AgentEvent::CompactionFailed(error.to_string());
+                        }
+                    }
+                }
+
                 let provider_input: Cow<'_, Conversation> = if vision_enabled {
                     Cow::Borrowed(conversation)
                 } else {
                     Cow::Owned(conversation.without_images())
                 };
 
-                let result = {
-                    let completion = self.provider.complete(
+                // Cancellation wins when both become ready in one poll.
+                let result = cancel_or(
+                    control,
+                    self.provider.complete(
                         context.as_ref().expect("agent context exists").continuation(),
                         model,
                         &provider_input,
                         &tool_specs,
-                    );
-                    let cancellation = control.cancelled();
-                    futures::pin_mut!(completion, cancellation);
-                    futures::future::poll_fn(|cx| {
-                        // Cancellation wins when both become ready in one poll.
-                        if cancellation.as_mut().poll(cx).is_ready() {
-                            Poll::Ready(None)
-                        } else {
-                            completion.as_mut().poll(cx).map(Some)
-                        }
-                    }).await
-                };
+                    ),
+                )
+                .await;
 
                 let (message, next_continuation) = match result {
                     Some(Ok(completion)) if !control.is_cancelled() => completion,

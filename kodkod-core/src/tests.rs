@@ -14,9 +14,9 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
-    Agent, AgentError, AgentEvent, AssistantMessage, Conversation, Image, Message, Provider,
-    TaskControl, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture,
-    ToolResult, ToolResultOutcome, ToolSpec, UserMessage,
+    Agent, AgentError, AgentEvent, AssistantMessage, CompactOptions, Conversation, Image, Message,
+    Provider, TaskControl, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture,
+    ToolResult, ToolResultOutcome, ToolSpec, TurnCompaction, UserMessage,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1379,6 +1379,7 @@ async fn run_turn_in_retains_only_accepted_checkpoints_while_fresh_apis_reset() 
             UserMessage::new(prompt),
             &mut context,
             &control,
+            None,
         );
         while task.next().await.is_some() {}
     }
@@ -1454,6 +1455,7 @@ async fn cancelled_completion_does_not_advance_retained_context() {
         UserMessage::new("first"),
         &mut context,
         &first_control,
+        None,
     );
     assert!(matches!(
         first.next().await.unwrap(),
@@ -1468,6 +1470,7 @@ async fn cancelled_completion_does_not_advance_retained_context() {
         UserMessage::new("second"),
         &mut context,
         &second_control,
+        None,
     );
     while second.next().await.is_some() {}
     drop(second);
@@ -1480,5 +1483,300 @@ async fn cancelled_completion_does_not_advance_retained_context() {
             .filter(|m| matches!(m, Message::Assistant(_)))
             .count(),
         1
+    );
+}
+
+fn summary_reply(summary: &str) -> AssistantMessage {
+    AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+        "sum-1",
+        "summarize",
+        json!({ "summary": summary }),
+    )])
+}
+
+fn history_needing_compact() -> Conversation {
+    let mut conversation = Conversation::new().with_system_prompt("be helpful");
+    conversation.push_user_message(UserMessage::new("old task"));
+    conversation.push_message(Message::Assistant(AssistantMessage::new("x".repeat(300))));
+    conversation.push_user_message(UserMessage::new("latest task"));
+    conversation.push_message(Message::Assistant(AssistantMessage::new("y".repeat(300))));
+    conversation
+}
+
+fn tiny_tail() -> CompactOptions {
+    CompactOptions {
+        keep_tail_tokens: 1,
+    }
+}
+
+struct CompactingProvider {
+    seen: Arc<Mutex<Vec<(usize, Conversation)>>>,
+    summarize: Arc<Mutex<Result<AssistantMessage, TestError>>>,
+    hang_summarize: bool,
+}
+
+impl CompactingProvider {
+    fn new(summary: &str) -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            summarize: Arc::new(Mutex::new(Ok(summary_reply(summary)))),
+            hang_summarize: false,
+        }
+    }
+}
+
+impl Provider for CompactingProvider {
+    type Model = TestModel;
+    type Error = TestError;
+    type Continuation = usize;
+
+    fn supports_vision(&self, _: &Self::Model) -> bool {
+        false
+    }
+    fn create_continuation(&self, _: &Self::Model) -> usize {
+        0
+    }
+    async fn complete(
+        &self,
+        continuation: &usize,
+        _: &Self::Model,
+        conversation: &Conversation,
+        tools: &[ToolSpec],
+    ) -> Result<(AssistantMessage, usize), TestError> {
+        if tools.iter().any(|tool| tool.name() == "summarize") {
+            if self.hang_summarize {
+                futures::future::pending::<()>().await;
+            }
+            return self
+                .summarize
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|message| (message, *continuation));
+        }
+        self.seen
+            .lock()
+            .unwrap()
+            .push((*continuation, conversation.clone()));
+        Ok((AssistantMessage::new("done"), continuation + 1))
+    }
+}
+
+#[tokio::test]
+async fn compact_request_rewrites_conversation_and_resets_continuation() {
+    let provider = CompactingProvider::new("SUM");
+    let seen = Arc::clone(&provider.seen);
+    let agent = Agent::new(provider);
+    let model = TestModel::new();
+    let mut conversation = history_needing_compact();
+    let mut context = agent.new_context(&model);
+    let control = TaskControl::new();
+    control.request_compact();
+    let mut task = agent.run_turn_in(
+        &mut conversation,
+        &model,
+        UserMessage::new("next"),
+        &mut context,
+        &control,
+        Some(TurnCompaction {
+            model: &model,
+            options: tiny_tail(),
+        }),
+    );
+
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::CompactionStarted
+    ));
+    let AgentEvent::Compacted(compacted) = task.next().await.unwrap().unwrap() else {
+        panic!("expected Compacted");
+    };
+    assert!(matches!(
+        compacted.messages().first(),
+        Some(Message::Assistant(message)) if message.content() == "SUM"
+    ));
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::AssistantReply(_)
+    ));
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::Completed(_)
+    ));
+    drop(task);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, 0, "continuation must reset after compact");
+    assert!(matches!(
+        seen[0].1.messages().first(),
+        Some(Message::Assistant(message)) if message.content() == "SUM"
+    ));
+    assert_eq!(
+        &conversation.messages()[..seen[0].1.messages().len()],
+        seen[0].1.messages()
+    );
+}
+
+#[tokio::test]
+async fn compact_is_not_run_without_a_request() {
+    let provider = CompactingProvider::new("SUM");
+    let seen = Arc::clone(&provider.seen);
+    let agent = Agent::new(provider);
+    let model = TestModel::new();
+    let mut conversation = history_needing_compact();
+    let mut context = agent.new_context(&model);
+    let control = TaskControl::new();
+    let mut task = agent.run_turn_in(
+        &mut conversation,
+        &model,
+        UserMessage::new("next"),
+        &mut context,
+        &control,
+        Some(TurnCompaction {
+            model: &model,
+            options: tiny_tail(),
+        }),
+    );
+    while task.next().await.is_some() {}
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        !seen[0]
+            .1
+            .messages()
+            .iter()
+            .any(|message| matches!(message, Message::Assistant(a) if a.content() == "SUM"))
+    );
+}
+
+#[tokio::test]
+async fn compact_failure_is_fail_open() {
+    let provider = CompactingProvider {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        summarize: Arc::new(Mutex::new(Err(TestError("nope")))),
+        hang_summarize: false,
+    };
+    let agent = Agent::new(provider);
+    let model = TestModel::new();
+    let mut conversation = history_needing_compact();
+    let before = conversation.clone();
+    let mut context = agent.new_context(&model);
+    let control = TaskControl::new();
+    control.request_compact();
+    let mut task = agent.run_turn_in(
+        &mut conversation,
+        &model,
+        UserMessage::new("next"),
+        &mut context,
+        &control,
+        Some(TurnCompaction {
+            model: &model,
+            options: tiny_tail(),
+        }),
+    );
+
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::CompactionStarted
+    ));
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::CompactionFailed(error) if error == "nope"
+    ));
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::AssistantReply(_)
+    ));
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::Completed(_)
+    ));
+    drop(task);
+    assert_eq!(conversation.messages()[0], before.messages()[0]);
+}
+
+#[tokio::test]
+async fn cancel_wins_during_compact() {
+    let provider = CompactingProvider {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        summarize: Arc::new(Mutex::new(Ok(summary_reply("SUM")))),
+        hang_summarize: true,
+    };
+    let agent = Agent::new(provider);
+    let model = TestModel::new();
+    let mut conversation = history_needing_compact();
+    let mut context = agent.new_context(&model);
+    let control = TaskControl::new();
+    control.request_compact();
+    let mut task = agent.run_turn_in(
+        &mut conversation,
+        &model,
+        UserMessage::new("next"),
+        &mut context,
+        &control,
+        Some(TurnCompaction {
+            model: &model,
+            options: tiny_tail(),
+        }),
+    );
+
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::CompactionStarted
+    ));
+    control.cancel();
+    assert!(matches!(
+        task.next().await.unwrap(),
+        Err(AgentError::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn drained_steers_are_visible_to_compact() {
+    let provider = CompactingProvider::new("SUM");
+    let seen = Arc::clone(&provider.seen);
+    let agent = Agent::new(provider);
+    let model = TestModel::new();
+    let mut conversation = history_needing_compact();
+    let mut context = agent.new_context(&model);
+    let control = TaskControl::new();
+    let mut task = agent.run_turn_in(
+        &mut conversation,
+        &model,
+        UserMessage::new("next"),
+        &mut context,
+        &control,
+        Some(TurnCompaction {
+            model: &model,
+            options: tiny_tail(),
+        }),
+    );
+    control
+        .steer(UserMessage::new("nudge"))
+        .expect("turn is open");
+    control.request_compact();
+
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::Steered(_)
+    ));
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::CompactionStarted
+    ));
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::Compacted(_)
+    ));
+    while task.next().await.is_some() {}
+
+    assert!(
+        seen.lock().unwrap()[0]
+            .1
+            .messages()
+            .iter()
+            .any(|message| matches!(message, Message::User(user) if user.content() == "nudge"))
     );
 }
