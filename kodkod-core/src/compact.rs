@@ -2,11 +2,16 @@ use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
 
-use crate::{AssistantMessage, Conversation, Message, Provider, UserMessage};
+use serde_json::{Value, json};
+
+use crate::{AssistantMessage, Conversation, Message, Provider, ToolSpec, UserMessage};
 
 pub const DEFAULT_KEEP_TAIL_TOKENS: u64 = 20_000;
 
-const COMPACTION_USER: &str = include_str!("compact/prompt.txt");
+const COMPACTION_SYSTEM: &str = include_str!("compact/prompt.txt");
+const COMPACTION_USER: &str =
+    "Call summarize now with the handoff summary. Do not reply to the user.";
+const SUMMARIZE_TOOL: &str = "summarize";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactOptions {
@@ -25,6 +30,7 @@ impl Default for CompactOptions {
 pub enum CompactError<E> {
     NothingToCompact,
     EmptySummary,
+    MissingSummary,
     Provider(E),
 }
 
@@ -33,6 +39,7 @@ impl<E: fmt::Display> fmt::Display for CompactError<E> {
         match self {
             Self::NothingToCompact => f.write_str("conversation has nothing to compact"),
             Self::EmptySummary => f.write_str("compaction model returned an empty summary"),
+            Self::MissingSummary => f.write_str("compaction model did not call summarize"),
             Self::Provider(error) => write!(f, "{error}"),
         }
     }
@@ -42,7 +49,7 @@ impl<E: StdError + 'static> StdError for CompactError<E> {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Provider(error) => Some(error),
-            Self::NothingToCompact | Self::EmptySummary => None,
+            Self::NothingToCompact | Self::EmptySummary | Self::MissingSummary => None,
         }
     }
 }
@@ -60,13 +67,10 @@ pub(crate) async fn run<P: Provider + ?Sized>(
         tail_starts_at(&kept, conversation.messages().len()),
     );
     let message = provider
-        .complete_once(model, &request, &[])
+        .complete_once(model, &request, &[summarize_tool()])
         .await
         .map_err(CompactError::Provider)?;
-    let summary = message.content().trim();
-    if summary.is_empty() {
-        return Err(CompactError::EmptySummary);
-    }
+    let summary = summary_from_reply(&message)?;
     Ok(splice(conversation, &kept, AssistantMessage::new(summary)))
 }
 
@@ -199,15 +203,46 @@ fn splice_messages(
 }
 
 fn summarizer_conversation(conversation: &Conversation, tail_starts_at: usize) -> Conversation {
-    let mut request = match conversation.system_prompt() {
-        Some(prompt) => Conversation::new().with_system_prompt(prompt),
-        None => Conversation::new(),
-    };
+    let mut request = Conversation::new().with_system_prompt(COMPACTION_SYSTEM.trim());
     for message in &conversation.messages()[..tail_starts_at] {
         request.push_message(message.clone());
     }
-    request.push_user_message(UserMessage::new(COMPACTION_USER.trim()));
+    request.push_user_message(UserMessage::new(COMPACTION_USER));
     request
+}
+
+fn summarize_tool() -> ToolSpec {
+    ToolSpec::new(
+        SUMMARIZE_TOOL,
+        "Submit the compaction handoff summary.",
+        json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "The handoff summary in the required Markdown structure."
+                }
+            },
+            "required": ["summary"]
+        }),
+    )
+}
+
+fn summary_from_reply<E>(message: &AssistantMessage) -> Result<String, CompactError<E>> {
+    let call = message
+        .tool_calls()
+        .iter()
+        .find(|call| call.name() == SUMMARIZE_TOOL)
+        .ok_or(CompactError::MissingSummary)?;
+    let summary = match call.arguments().get("summary") {
+        Some(Value::String(summary)) => summary.trim(),
+        _ => return Err(CompactError::MissingSummary),
+    };
+    if summary.is_empty() {
+        Err(CompactError::EmptySummary)
+    } else {
+        Ok(summary.to_owned())
+    }
 }
 
 #[cfg(test)]
@@ -377,16 +412,28 @@ mod tests {
 
     impl Error for TestError {}
 
+    fn summary_reply(summary: &str) -> AssistantMessage {
+        AssistantMessage::new("").with_tool_calls(vec![ToolCall::new(
+            "sum-1",
+            SUMMARIZE_TOOL,
+            json!({ "summary": summary }),
+        )])
+    }
+
     #[derive(Clone)]
     struct FakeProvider {
-        reply: Result<String, TestError>,
+        reply: Result<AssistantMessage, TestError>,
         created: Arc<AtomicUsize>,
         completes: Arc<AtomicUsize>,
         seen: Arc<Mutex<Vec<(usize, Conversation)>>>,
     }
 
     impl FakeProvider {
-        fn new(reply: Result<String, TestError>) -> Self {
+        fn with_summary(summary: &str) -> Self {
+            Self::new(Ok(summary_reply(summary)))
+        }
+
+        fn new(reply: Result<AssistantMessage, TestError>) -> Self {
             Self {
                 reply,
                 created: Arc::new(AtomicUsize::new(0)),
@@ -422,11 +469,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((tools.len(), conversation.clone()));
-            ready(
-                self.reply
-                    .clone()
-                    .map(|text| (AssistantMessage::new(text), ())),
-            )
+            ready(self.reply.clone().map(|message| (message, ())))
         }
     }
 
@@ -455,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_uses_a_fresh_one_shot_summarizer_request() {
-        let provider = FakeProvider::new(Ok("SUM".into()));
+        let provider = FakeProvider::with_summary("SUM");
         let conversation = history_needing_compact();
         let compacted = provider
             .compact(&(), &conversation, last_message_tail(&conversation))
@@ -466,9 +509,10 @@ mod tests {
         assert_eq!(provider.completes.load(Ordering::SeqCst), 1);
         let seen = provider.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].0, 0);
+        assert_eq!(seen[0].0, 1);
         assert_ne!(seen[0].1, conversation);
-        assert_eq!(seen[0].1.system_prompt(), Some("be helpful"));
+        assert_eq!(seen[0].1.system_prompt(), Some(COMPACTION_SYSTEM.trim()));
+        assert_ne!(seen[0].1.system_prompt(), conversation.system_prompt());
         let request = seen[0].1.messages();
         assert!(
             request
@@ -482,7 +526,7 @@ mod tests {
         );
         assert!(matches!(
             request.last(),
-            Some(Message::User(user)) if user.content() == COMPACTION_USER.trim()
+            Some(Message::User(user)) if user.content() == COMPACTION_USER
         ));
 
         assert_eq!(compacted.system_prompt(), Some("be helpful"));
@@ -518,7 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_sends_an_existing_summary_as_a_normal_message() {
-        let provider = FakeProvider::new(Ok("SUM".into()));
+        let provider = FakeProvider::with_summary("SUM");
         let mut conversation = Conversation::new();
         conversation.push_message(Message::Assistant(AssistantMessage::new("old summary")));
         conversation.push_message(Message::User(UserMessage::new("more work")));
@@ -547,7 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_does_not_mutate_the_original_conversation() {
-        let provider = FakeProvider::new(Ok("SUM".into()));
+        let provider = FakeProvider::with_summary("SUM");
         let conversation = history_needing_compact();
         let before = conversation.clone();
         let _ = provider
@@ -559,12 +603,23 @@ mod tests {
 
     #[tokio::test]
     async fn empty_summary_is_an_error() {
-        let provider = FakeProvider::new(Ok("  \n".into()));
+        let provider = FakeProvider::with_summary("  \n");
         let error = provider
             .compact(&(), &history_needing_compact(), tiny_tail())
             .await
             .unwrap_err();
         assert_eq!(error, CompactError::EmptySummary);
+        assert_eq!(provider.completes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn text_reply_without_summarize_tool_is_an_error() {
+        let provider = FakeProvider::new(Ok(AssistantMessage::new("SUM")));
+        let error = provider
+            .compact(&(), &history_needing_compact(), tiny_tail())
+            .await
+            .unwrap_err();
+        assert_eq!(error, CompactError::MissingSummary);
         assert_eq!(provider.completes.load(Ordering::SeqCst), 1);
     }
 
@@ -580,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn nothing_to_compact_does_not_call_the_provider() {
-        let provider = FakeProvider::new(Ok("SUM".into()));
+        let provider = FakeProvider::with_summary("SUM");
         let mut conversation = Conversation::new();
         conversation.push_user_message(UserMessage::new("hello"));
         conversation.push_message(Message::Assistant(AssistantMessage::new("hi")));
