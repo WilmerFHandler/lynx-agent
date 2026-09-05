@@ -329,21 +329,35 @@ fn convert_tool(spec: &ToolSpec) -> Value {
 
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_ASSEMBLED_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OUTPUT_ITEMS: usize = 512;
 
 async fn read_terminal_response(response: reqwest::Response) -> Result<Value, OpenAiError> {
     let mut stream = response.bytes_stream();
     let mut decoder = SseDecoder::default();
+    let mut output = OutputAccumulator::default();
     while let Some(chunk) = stream.next().await {
-        for event in decoder.push(&chunk?)? {
-            if let Some(terminal) = handle_sse_event(event)? {
-                return Ok(terminal);
-            }
+        if let Some(terminal) = process_sse_chunk(&mut decoder, &mut output, &chunk?)? {
+            return Ok(terminal);
         }
     }
     decoder.finish()?;
     Err(OpenAiError::Protocol(
         "stream ended without a terminal event".into(),
     ))
+}
+
+fn process_sse_chunk(
+    decoder: &mut SseDecoder,
+    output: &mut OutputAccumulator,
+    chunk: &[u8],
+) -> Result<Option<Value>, OpenAiError> {
+    for event in decoder.push(chunk)? {
+        if let Some(terminal) = handle_sse_event(event, output)? {
+            return Ok(Some(terminal));
+        }
+    }
+    Ok(None)
 }
 
 async fn read_limited_body(
@@ -371,6 +385,104 @@ struct SseDecoder {
 struct SseEvent {
     event_name: Option<String>,
     data: String,
+}
+
+#[derive(Default)]
+struct OutputAccumulator {
+    items: BTreeMap<usize, Value>,
+    serialized_bytes: usize,
+}
+
+impl OutputAccumulator {
+    fn insert(&mut self, payload: &Value) -> Result<(), OpenAiError> {
+        let index = payload
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or_else(|| {
+                OpenAiError::Protocol("output_item.done missing valid output_index".into())
+            })?;
+        if index >= MAX_OUTPUT_ITEMS {
+            return Err(OpenAiError::Protocol(format!(
+                "output_index {index} exceeds item limit"
+            )));
+        }
+        let item = payload
+            .get("item")
+            .cloned()
+            .ok_or_else(|| OpenAiError::Protocol("output_item.done missing item".into()))?;
+        if self.items.contains_key(&index) {
+            return Err(OpenAiError::Protocol(format!(
+                "duplicate output_item.done index {index}"
+            )));
+        }
+        if let Some(id) = item.get("id").and_then(Value::as_str)
+            && self
+                .items
+                .values()
+                .any(|existing| existing.get("id").and_then(Value::as_str) == Some(id))
+        {
+            return Err(OpenAiError::Protocol(format!(
+                "duplicate output item id at index {index}"
+            )));
+        }
+        let bytes = serde_json::to_vec(&item)?.len();
+        self.serialized_bytes = self
+            .serialized_bytes
+            .checked_add(bytes)
+            .filter(|bytes| *bytes <= MAX_ASSEMBLED_OUTPUT_BYTES)
+            .ok_or_else(|| {
+                OpenAiError::Protocol("assembled response output exceeded size limit".into())
+            })?;
+        self.items.insert(index, item);
+        Ok(())
+    }
+
+    fn validate_final(&self, final_output: &[Value]) -> Result<(), OpenAiError> {
+        for (&index, streamed) in &self.items {
+            let final_item = final_output.get(index).ok_or_else(|| {
+                OpenAiError::Protocol(format!(
+                    "completed output missing streamed item at index {index}"
+                ))
+            })?;
+            validate_item_identity(index, streamed, final_item)?;
+        }
+        Ok(())
+    }
+
+    fn take_ordered(&mut self) -> Result<Vec<Value>, OpenAiError> {
+        for (expected, actual) in self.items.keys().copied().enumerate() {
+            if expected != actual {
+                return Err(OpenAiError::Protocol(format!(
+                    "response output indices are not contiguous: expected {expected}, got {actual}"
+                )));
+            }
+        }
+        self.serialized_bytes = 0;
+        Ok(std::mem::take(&mut self.items).into_values().collect())
+    }
+}
+
+fn validate_item_identity(
+    index: usize,
+    streamed: &Value,
+    final_item: &Value,
+) -> Result<(), OpenAiError> {
+    for field in ["type", "id"] {
+        if streamed.get(field) != final_item.get(field) {
+            return Err(OpenAiError::Protocol(format!(
+                "completed output {field} disagrees with streamed item at index {index}"
+            )));
+        }
+    }
+    if streamed.get("type").and_then(Value::as_str) == Some("function_call")
+        && streamed.get("call_id") != final_item.get("call_id")
+    {
+        return Err(OpenAiError::Protocol(format!(
+            "completed output call_id disagrees with streamed item at index {index}"
+        )));
+    }
+    Ok(())
 }
 
 impl SseDecoder {
@@ -438,7 +550,10 @@ fn parse_sse_block(payload: &[u8]) -> Result<Option<SseEvent>, OpenAiError> {
     Ok(Some(SseEvent { event_name, data }))
 }
 
-fn handle_sse_event(event: SseEvent) -> Result<Option<Value>, OpenAiError> {
+fn handle_sse_event(
+    event: SseEvent,
+    output: &mut OutputAccumulator,
+) -> Result<Option<Value>, OpenAiError> {
     let payload: Value = serde_json::from_str(&event.data)?;
     let kind = payload
         .get("type")
@@ -446,11 +561,26 @@ fn handle_sse_event(event: SseEvent) -> Result<Option<Value>, OpenAiError> {
         .or(event.event_name.as_deref())
         .unwrap_or_default();
     match kind {
-        "response.completed" => payload
-            .get("response")
-            .cloned()
-            .map(Some)
-            .ok_or_else(|| OpenAiError::Protocol("completed event missing response".into())),
+        "response.output_item.done" => {
+            output.insert(&payload)?;
+            Ok(None)
+        }
+        "response.completed" => {
+            let mut response = payload
+                .get("response")
+                .cloned()
+                .ok_or_else(|| OpenAiError::Protocol("completed event missing response".into()))?;
+            let final_output = response
+                .get("output")
+                .and_then(Value::as_array)
+                .ok_or_else(|| OpenAiError::Protocol("completed response missing output".into()))?;
+            if final_output.is_empty() && !output.items.is_empty() {
+                response["output"] = Value::Array(output.take_ordered()?);
+            } else {
+                output.validate_final(final_output)?;
+            }
+            Ok(Some(response))
+        }
         "response.failed" => Err(response_failure(&payload)),
         "response.incomplete" => {
             let reason = payload
@@ -592,12 +722,22 @@ mod tests {
         )
     }
 
+    fn output_item_done(index: usize, item: Value) -> String {
+        format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": item
+            })
+        )
+    }
+
     fn parse_complete_stream(body: &[u8]) -> Result<Value, OpenAiError> {
         let mut decoder = SseDecoder::default();
-        for event in decoder.push(body)? {
-            if let Some(response) = handle_sse_event(event)? {
-                return Ok(response);
-            }
+        let mut output = OutputAccumulator::default();
+        if let Some(response) = process_sse_chunk(&mut decoder, &mut output, body)? {
+            return Ok(response);
         }
         decoder.finish()?;
         Err(OpenAiError::Protocol(
@@ -660,6 +800,177 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.content(), "done");
+    }
+
+    #[test]
+    fn assembles_done_items_when_codex_completed_output_is_empty() {
+        let reasoning = json!({
+            "id":"rs_1", "type":"reasoning", "encrypted_content":"opaque"
+        });
+        let call = json!({
+            "id":"fc_1", "type":"function_call", "call_id":"call_1",
+            "name":"lookup", "arguments":"{\"q\":\"x\"}"
+        });
+        let message = json!({
+            "id":"msg_1", "type":"message", "role":"assistant",
+            "content":[{"type":"output_text", "text":"working"}]
+        });
+        let body = format!(
+            "event: response.output_item.added\ndata: {}\n\n{}{}{}{}",
+            json!({
+                "type":"response.output_item.added", "output_index":0,
+                "item":{"id":"rs_1", "type":"reasoning"}
+            }),
+            output_item_done(0, reasoning),
+            output_item_done(1, call),
+            output_item_done(2, message),
+            completed(json!([])),
+        );
+        let response = parse_complete_stream(body.as_bytes()).unwrap();
+        let output = response["output"].as_array().unwrap().clone();
+        let assistant = parse_output(&output).unwrap();
+        let continuation = ResponsesContinuation {
+            checkpoints: vec![ResponseCheckpoint {
+                model: "gpt-test".into(),
+                assistant_message_index: 1,
+                assistant: assistant.clone(),
+                output,
+            }],
+        };
+
+        assert_eq!(assistant.content(), "working");
+        assert_eq!(assistant.tool_calls()[0].name(), "lookup");
+        let serialized = serde_json::to_value(continuation).unwrap();
+        let output = serialized["checkpoints"][0]["output"].as_array().unwrap();
+        assert_eq!(output[0]["encrypted_content"], "opaque");
+        assert_eq!(output[1]["call_id"], "call_1");
+        assert_eq!(output[2]["id"], "msg_1");
+    }
+
+    #[test]
+    fn completed_output_is_authoritative_and_may_add_metadata() {
+        let streamed = json!({
+            "id":"msg_1", "type":"message", "role":"assistant",
+            "content":[{"type":"output_text", "text":"done"}]
+        });
+        let final_item = json!({
+            "id":"msg_1", "type":"message", "role":"assistant",
+            "status":"completed", "content":[{"type":"output_text", "text":"final"}]
+        });
+        let response = parse_complete_stream(
+            format!(
+                "{}{}",
+                output_item_done(0, streamed),
+                completed(json!([final_item]))
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(response["output"][0]["id"], "msg_1");
+        assert_eq!(response["output"][0]["status"], "completed");
+        assert_eq!(response["output"][0]["content"][0]["text"], "final");
+    }
+
+    #[test]
+    fn rejects_duplicate_gapped_or_inconsistent_done_items() {
+        let first = json!({
+            "id":"msg_1", "type":"message", "role":"assistant",
+            "content":[{"type":"output_text", "text":"one"}]
+        });
+        let second = json!({
+            "id":"msg_2", "type":"message", "role":"assistant",
+            "content":[{"type":"output_text", "text":"two"}]
+        });
+
+        let duplicate = format!(
+            "{}{}{}",
+            output_item_done(0, first.clone()),
+            output_item_done(0, second.clone()),
+            completed(json!([]))
+        );
+        assert!(
+            matches!(parse_complete_stream(duplicate.as_bytes()), Err(OpenAiError::Protocol(message)) if message.contains("duplicate"))
+        );
+
+        let gapped = format!(
+            "{}{}",
+            output_item_done(1, first.clone()),
+            completed(json!([]))
+        );
+        assert!(
+            matches!(parse_complete_stream(gapped.as_bytes()), Err(OpenAiError::Protocol(message)) if message.contains("contiguous"))
+        );
+
+        let inconsistent = format!(
+            "{}{}",
+            output_item_done(0, first),
+            completed(json!([second]))
+        );
+        assert!(
+            matches!(parse_complete_stream(inconsistent.as_bytes()), Err(OpenAiError::Protocol(message)) if message.contains("id disagrees"))
+        );
+    }
+
+    #[test]
+    fn rejects_truncation_after_a_done_item() {
+        let stream = format!(
+            "{}event: response.completed\ndata: {{",
+            output_item_done(
+                0,
+                json!({
+                    "id":"msg_1", "type":"message", "role":"assistant",
+                    "content":[{"type":"output_text", "text":"partial"}]
+                })
+            )
+        );
+        assert!(
+            matches!(parse_complete_stream(stream.as_bytes()), Err(OpenAiError::Protocol(message)) if message.contains("truncated"))
+        );
+    }
+
+    #[test]
+    fn bounds_accumulated_output_items_and_bytes() {
+        let mut output = OutputAccumulator::default();
+        let too_many = json!({
+            "output_index": MAX_OUTPUT_ITEMS,
+            "item": {"id":"msg_limit", "type":"message"}
+        });
+        assert!(
+            matches!(output.insert(&too_many), Err(OpenAiError::Protocol(message)) if message.contains("item limit"))
+        );
+
+        let oversized = json!({
+            "output_index": 0,
+            "item": {
+                "id":"msg_large", "type":"message",
+                "content":"x".repeat(MAX_ASSEMBLED_OUTPUT_BYTES)
+            }
+        });
+        assert!(
+            matches!(output.insert(&oversized), Err(OpenAiError::Protocol(message)) if message.contains("size limit"))
+        );
+    }
+
+    #[test]
+    fn incomplete_event_wins_over_accumulated_done_items() {
+        let stream = format!(
+            "{}event: response.incomplete\ndata: {}\n\n",
+            output_item_done(
+                0,
+                json!({
+                    "id":"msg_1", "type":"message", "role":"assistant",
+                    "content":[{"type":"output_text", "text":"partial"}]
+                })
+            ),
+            json!({
+                "type":"response.incomplete",
+                "response":{"incomplete_details":{"reason":"max_output_tokens"}}
+            })
+        );
+        assert!(matches!(
+            parse_complete_stream(stream.as_bytes()),
+            Err(OpenAiError::Incomplete { reason }) if reason == "max_output_tokens"
+        ));
     }
 
     #[test]
@@ -734,7 +1045,7 @@ mod tests {
         let events = decoder.push(&bytes[split..]).unwrap();
         let response = events
             .into_iter()
-            .find_map(|event| handle_sse_event(event).unwrap())
+            .find_map(|event| handle_sse_event(event, &mut OutputAccumulator::default()).unwrap())
             .unwrap();
         assert_eq!(
             parse_output(response["output"].as_array().unwrap())
@@ -757,11 +1068,11 @@ mod tests {
         }]));
         let mut decoder = SseDecoder::default();
         let events = decoder.push(terminal.as_bytes()).unwrap();
-        assert!(
-            events
-                .into_iter()
-                .any(|event| handle_sse_event(event).unwrap().is_some())
-        );
+        assert!(events.into_iter().any(|event| {
+            handle_sse_event(event, &mut OutputAccumulator::default())
+                .unwrap()
+                .is_some()
+        }));
     }
 
     #[test]
