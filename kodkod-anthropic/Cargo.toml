@@ -1,12 +1,11 @@
 [package]
-name = "kodkod-openai"
+name = "kodkod-anthropic"
 version = "0.1.0"
 edition = "2024"
-description = "OpenAI-compatible provider for kodkod."
+description = "Anthropic Messages provider for Kodkod."
 license = "MIT"
-readme = "README.md"
 repository = "https://github.com/WilmerFHandler/kodkod"
-keywords = ["agent", "llm", "openai"]
+keywords = ["agent", "llm", "anthropic"]
 categories = ["asynchronous"]
 
 [dependencies]
@@ -17,11 +16,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-[dependencies.tokio]
-version = "1"
-default-features = false
-features = ["rt", "macros"]
-
 [dev-dependencies]
-wiremock = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"

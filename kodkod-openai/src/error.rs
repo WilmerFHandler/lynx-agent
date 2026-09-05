@@ -3,12 +3,17 @@ use std::fmt;
 
 use kodkod_core::Retryable;
 
+use crate::CredentialError;
+
 #[derive(Debug)]
 pub enum OpenAiError {
     Http(reqwest::Error),
     Api { status: u16, message: String },
     Json(serde_json::Error),
     EmptyResponse,
+    Credentials(CredentialError),
+    Incomplete { reason: String },
+    Protocol(String),
 }
 
 impl fmt::Display for OpenAiError {
@@ -18,6 +23,9 @@ impl fmt::Display for OpenAiError {
             Self::Api { status, message } => write!(f, "api error ({status}): {message}"),
             Self::Json(error) => write!(f, "failed to parse response: {error}"),
             Self::EmptyResponse => f.write_str("chat completion returned no choices"),
+            Self::Credentials(error) => write!(f, "credentials unavailable: {error}"),
+            Self::Incomplete { reason } => write!(f, "response incomplete: {reason}"),
+            Self::Protocol(message) => write!(f, "response protocol error: {message}"),
         }
     }
 }
@@ -34,11 +42,18 @@ impl From<serde_json::Error> for OpenAiError {
     }
 }
 
+impl From<CredentialError> for OpenAiError {
+    fn from(error: CredentialError) -> Self {
+        Self::Credentials(error)
+    }
+}
+
 impl Error for OpenAiError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Http(error) => Some(error),
             Self::Json(error) => Some(error),
+            Self::Credentials(error) => Some(error),
             _ => None,
         }
     }
@@ -49,7 +64,11 @@ impl Retryable for OpenAiError {
         match self {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
             Self::Api { status, .. } => matches!(*status, 429 | 500 | 502 | 503 | 504),
-            Self::Json(_) | Self::EmptyResponse => false,
+            Self::Json(_)
+            | Self::EmptyResponse
+            | Self::Credentials(_)
+            | Self::Incomplete { .. }
+            | Self::Protocol(_) => false,
         }
     }
 }

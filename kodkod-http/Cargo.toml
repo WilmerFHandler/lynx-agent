@@ -1,0 +1,11 @@
+[package]
+name = "kodkod-http"
+version = "0.1.0"
+edition = "2024"
+description = "Caller-owned HTTP credentials for Kodkod providers."
+license = "MIT"
+repository = "https://github.com/WilmerFHandler/kodkod"
+categories = ["asynchronous"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false }

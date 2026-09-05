@@ -11,8 +11,12 @@ categories = ["asynchronous"]
 
 [features]
 default = []
-openai = ["dep:kodkod-openai"]
+openai = ["dep:kodkod-openai", "dep:kodkod-http"]
+anthropic = ["dep:kodkod-anthropic", "dep:kodkod-http"]
+http = ["dep:kodkod-http"]
 
 [dependencies]
 kodkod-core = { path = "../kodkod-core", version = "0.1.0" }
+kodkod-http = { path = "../kodkod-http", optional = true, version = "0.1.0" }
 kodkod-openai = { path = "../kodkod-openai", optional = true, version = "0.1.0" }
+kodkod-anthropic = { path = "../kodkod-anthropic", optional = true, version = "0.1.0" }

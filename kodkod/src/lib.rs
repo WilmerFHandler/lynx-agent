@@ -2,5 +2,11 @@
 
 pub use kodkod_core::*;
 
+#[cfg(any(feature = "http", feature = "openai", feature = "anthropic"))]
+pub use kodkod_http as http;
+
 #[cfg(feature = "openai")]
 pub use kodkod_openai as openai;
+
+#[cfg(feature = "anthropic")]
+pub use kodkod_anthropic as anthropic;

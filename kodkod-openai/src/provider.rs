@@ -1,21 +1,24 @@
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use kodkod_core::{AssistantMessage, Conversation, Provider, ToolSpec};
 
 use super::completion;
 use super::error::OpenAiError;
 use super::model::OpenAiModel;
+use crate::{CredentialSource, StaticCredentials};
 
-/// Provider for OpenAI-compatible `/chat/completions` endpoints with a static bearer token.
+/// Provider for OpenAI-compatible `/chat/completions` endpoints.
 ///
 /// `M` is a zero-sized type marker tying this provider to your [`OpenAiModel`]
 /// implementation (e.g. `OpenAiCompatibleProvider::<MyModel>::new(url)`).
 ///
-/// For per-request bearer tokens (e.g. OAuth), use [`completion::complete`] directly.
+/// Use [`Self::with_credentials`] when the caller needs to supply fresh
+/// authentication headers for every request.
 #[derive(Clone)]
 pub struct OpenAiCompatibleProvider<M = ()> {
     chat_completions_url: String,
-    api_key: Option<String>,
+    credentials: Option<Arc<dyn CredentialSource>>,
     client: reqwest::Client,
     _model: PhantomData<M>,
 }
@@ -24,14 +27,19 @@ impl<M> OpenAiCompatibleProvider<M> {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             chat_completions_url: completion::chat_completions_url(&base_url.into()),
-            api_key: None,
+            credentials: None,
             client: reqwest::Client::new(),
             _model: PhantomData,
         }
     }
 
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
-        self.api_key = Some(api_key.into());
+        self.credentials = Some(Arc::new(StaticCredentials::bearer(api_key.into())));
+        self
+    }
+
+    pub fn with_credentials(mut self, credentials: Arc<dyn CredentialSource>) -> Self {
+        self.credentials = Some(credentials);
         self
     }
 
@@ -70,10 +78,14 @@ where
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
-        completion::complete(
+        let credentials = match &self.credentials {
+            Some(source) => Some(source.credentials().await?),
+            None => None,
+        };
+        completion::complete_with_credentials(
             &self.client,
             &self.chat_completions_url,
-            self.api_key.as_deref(),
+            credentials.as_ref(),
             model.id(),
             conversation,
             tools,
