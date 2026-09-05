@@ -209,6 +209,7 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
             .ok_or_else(|| {
                 AnthropicError::Protocol("message response missing stop_reason".into())
             })?;
+        validate_stop_reason_before_content(stop_reason)?;
         let content = body
             .get("content")
             .and_then(Value::as_array)
@@ -250,6 +251,7 @@ fn validate_stop_reason(
     stop_reason: &str,
     message: &AssistantMessage,
 ) -> Result<(), AnthropicError> {
+    validate_stop_reason_before_content(stop_reason)?;
     match stop_reason {
         "end_turn" | "stop_sequence" if message.tool_calls().is_empty() => Ok(()),
         "tool_use" if !message.tool_calls().is_empty() => Ok(()),
@@ -259,6 +261,15 @@ fn validate_stop_reason(
         "tool_use" => Err(AnthropicError::Protocol(
             "tool_use response contained no client tool calls".into(),
         )),
+        other => Err(AnthropicError::Protocol(format!(
+            "unexpected stop reason after validation: {other}"
+        ))),
+    }
+}
+
+fn validate_stop_reason_before_content(stop_reason: &str) -> Result<(), AnthropicError> {
+    match stop_reason {
+        "end_turn" | "stop_sequence" | "tool_use" => Ok(()),
         "max_tokens" | "model_context_window_exceeded" => Err(AnthropicError::Incomplete {
             reason: stop_reason.to_owned(),
         }),
@@ -488,7 +499,16 @@ impl fmt::Display for AnthropicError {
         }
     }
 }
-impl Error for AnthropicError {}
+impl Error for AnthropicError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Http(error) => Some(error),
+            Self::Json(error) => Some(error),
+            Self::Credentials(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 impl From<reqwest::Error> for AnthropicError {
     fn from(value: reqwest::Error) -> Self {
         Self::Http(value)
