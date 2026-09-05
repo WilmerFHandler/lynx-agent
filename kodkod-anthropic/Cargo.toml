@@ -9,6 +9,7 @@ keywords = ["agent", "llm", "anthropic"]
 categories = ["asynchronous"]
 
 [dependencies]
+async-stream = "0.3"
 kodkod-core = { path = "../kodkod-core", version = "0.1.0" }
 kodkod-http = { path = "../kodkod-http", version = "0.1.0" }
 futures-util = "0.3"

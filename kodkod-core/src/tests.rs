@@ -15,8 +15,9 @@ use serde_json::{Value, json};
 
 use crate::{
     Agent, AgentError, AgentEvent, AssistantMessage, CompactOptions, Conversation, Image, Message,
-    Provider, TaskControl, Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture,
-    ToolResult, ToolResultOutcome, ToolSpec, TurnCompaction, UserMessage,
+    Provider, ProviderEvent, ProviderStream, TaskControl, Tool, ToolCall, ToolError, ToolExecutor,
+    ToolExecutorError, ToolFuture, ToolResult, ToolResultOutcome, ToolSpec, TurnCompaction,
+    UserMessage,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1779,4 +1780,301 @@ async fn drained_steers_are_visible_to_compact() {
             .iter()
             .any(|message| matches!(message, Message::User(user) if user.content() == "nudge"))
     );
+}
+
+struct EventStreamProvider {
+    truncate: bool,
+}
+
+impl Provider for EventStreamProvider {
+    type Model = TestModel;
+    type Error = TestError;
+    type Continuation = usize;
+
+    fn create_continuation(&self, _: &Self::Model) -> usize {
+        0
+    }
+
+    fn supports_vision(&self, _: &Self::Model) -> bool {
+        false
+    }
+
+    fn estimate_continuation_tokens(continuation: &usize) -> u64 {
+        *continuation as u64
+    }
+
+    async fn complete(
+        &self,
+        continuation: &usize,
+        _: &Self::Model,
+        _: &Conversation,
+        _: &[ToolSpec],
+    ) -> Result<(AssistantMessage, usize), TestError> {
+        Ok((AssistantMessage::new("authoritative"), continuation + 1))
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        continuation: &'a usize,
+        _: &'a Self::Model,
+        _: &'a Conversation,
+        _: &'a [ToolSpec],
+    ) -> ProviderStream<'a, usize, TestError> {
+        let truncate = self.truncate;
+        let next = continuation + 1;
+        Box::pin(async_stream::try_stream! {
+            yield ProviderEvent::TextDelta("provisional ".into());
+            yield ProviderEvent::TextDelta("text".into());
+            if !truncate {
+                yield ProviderEvent::Completed(AssistantMessage::new("authoritative"), next);
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn agent_forwards_provisional_text_then_commits_authoritative_reply() {
+    let agent = Agent::new(EventStreamProvider { truncate: false });
+    let mut conversation = Conversation::new();
+    let events = collect_events(&agent, &mut conversation, "hello", &TestModel::new())
+        .await
+        .unwrap();
+
+    assert!(matches!(&events[0], AgentEvent::AssistantTextDelta(text) if text == "provisional "));
+    assert!(matches!(&events[1], AgentEvent::AssistantTextDelta(text) if text == "text"));
+    assert!(
+        matches!(&events[2], AgentEvent::AssistantReply(message) if message.content() == "authoritative")
+    );
+    assert!(
+        matches!(&events[3], AgentEvent::Completed(message) if message.content() == "authoritative")
+    );
+    assert!(
+        matches!(&conversation.messages()[1], Message::Assistant(message) if message.content() == "authoritative")
+    );
+}
+
+#[tokio::test]
+async fn truncated_provider_stream_does_not_commit_provisional_text() {
+    let agent = Agent::new(EventStreamProvider { truncate: true });
+    let mut conversation = Conversation::new();
+    let control = TaskControl::new();
+    let model = TestModel::new();
+    let mut context = agent.new_context(&model);
+    let mut task = agent.run_turn_in(
+        &mut conversation,
+        &model,
+        UserMessage::new("hello"),
+        &mut context,
+        &control,
+        None,
+    );
+
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::AssistantTextDelta(_)
+    ));
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::AssistantTextDelta(_)
+    ));
+    assert!(matches!(
+        task.next().await.unwrap(),
+        Err(AgentError::ProviderStreamEnded)
+    ));
+    drop(task);
+    assert_eq!(conversation.messages().len(), 1);
+    assert_eq!(context.estimated_continuation_tokens(), 0);
+}
+
+#[tokio::test]
+async fn successful_provider_stream_advances_the_retained_checkpoint() {
+    let agent = Agent::new(EventStreamProvider { truncate: false });
+    let mut conversation = Conversation::new();
+    let control = TaskControl::new();
+    let model = TestModel::new();
+    let mut context = agent.new_context(&model);
+    let mut task = agent.run_turn_in(
+        &mut conversation,
+        &model,
+        UserMessage::new("hello"),
+        &mut context,
+        &control,
+        None,
+    );
+    while task.next().await.is_some() {}
+    drop(task);
+    assert_eq!(context.estimated_continuation_tokens(), 1);
+}
+
+struct PendingEventStreamProvider;
+
+impl Provider for PendingEventStreamProvider {
+    type Model = TestModel;
+    type Error = TestError;
+    type Continuation = usize;
+
+    fn create_continuation(&self, _: &Self::Model) -> usize {
+        7
+    }
+    fn supports_vision(&self, _: &Self::Model) -> bool {
+        false
+    }
+    fn estimate_continuation_tokens(continuation: &usize) -> u64 {
+        *continuation as u64
+    }
+
+    async fn complete(
+        &self,
+        _: &usize,
+        _: &Self::Model,
+        _: &Conversation,
+        _: &[ToolSpec],
+    ) -> Result<(AssistantMessage, usize), TestError> {
+        unreachable!()
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _: &'a usize,
+        _: &'a Self::Model,
+        _: &'a Conversation,
+        _: &'a [ToolSpec],
+    ) -> ProviderStream<'a, usize, TestError> {
+        Box::pin(async_stream::try_stream! {
+            yield ProviderEvent::TextDelta("partial".into());
+            futures::future::pending::<()>().await;
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancellation_after_a_delta_does_not_advance_the_retained_checkpoint() {
+    let agent = Agent::new(PendingEventStreamProvider);
+    let mut conversation = Conversation::new();
+    let control = TaskControl::new();
+    let model = TestModel::new();
+    let mut context = agent.new_context(&model);
+    let mut task = agent.run_turn_in(
+        &mut conversation,
+        &model,
+        UserMessage::new("hello"),
+        &mut context,
+        &control,
+        None,
+    );
+    assert!(matches!(
+        task.next().await.unwrap().unwrap(),
+        AgentEvent::AssistantTextDelta(text) if text == "partial"
+    ));
+    control.cancel();
+    assert!(matches!(
+        task.next().await.unwrap(),
+        Err(AgentError::Cancelled)
+    ));
+    drop(task);
+    assert_eq!(context.estimated_continuation_tokens(), 7);
+    assert_eq!(conversation.messages().len(), 1);
+}
+
+struct NamedToolCallsProvider;
+
+impl Provider for NamedToolCallsProvider {
+    type Model = TestModel;
+    type Error = TestError;
+    type Continuation = ();
+
+    fn create_continuation(&self, _: &Self::Model) {}
+
+    fn supports_vision(&self, _: &Self::Model) -> bool {
+        false
+    }
+
+    async fn complete(
+        &self,
+        _: &(),
+        _: &Self::Model,
+        _: &Conversation,
+        _: &[ToolSpec],
+    ) -> Result<(AssistantMessage, ()), TestError> {
+        Ok((
+            AssistantMessage::new("").with_tool_calls(vec![
+                ToolCall::new("slow-call", "slow", json!({})),
+                ToolCall::new("fast-call", "fast", json!({})),
+            ]),
+            (),
+        ))
+    }
+}
+
+struct CountingTool {
+    name: &'static str,
+    calls: Arc<AtomicUsize>,
+    pending: bool,
+}
+
+impl Tool for CountingTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(self.name, "test tool", json!({ "type": "object" }))
+    }
+
+    fn execute<'a>(&'a self, _: &'a Value) -> ToolFuture<'a> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if self.pending {
+                futures::future::pending::<()>().await;
+            }
+            Ok(json!({ "tool": self.name }).into())
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancellation_keeps_each_finished_tool_result_without_waiting_for_siblings() {
+    let fast_calls = Arc::new(AtomicUsize::new(0));
+    let slow_calls = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new(NamedToolCallsProvider)
+        .with_tool(Arc::new(CountingTool {
+            name: "fast",
+            calls: Arc::clone(&fast_calls),
+            pending: false,
+        }))
+        .with_tool(Arc::new(CountingTool {
+            name: "slow",
+            calls: Arc::clone(&slow_calls),
+            pending: true,
+        }));
+    let mut conversation = Conversation::new();
+    let control = TaskControl::new();
+    let model = TestModel::new();
+    let mut task = agent.run_turn(
+        &mut conversation,
+        &model,
+        UserMessage::new("hello"),
+        &control,
+    );
+
+    while let Some(event) = task.next().await {
+        if matches!(event.unwrap(), AgentEvent::ToolFinished(ref result) if result.tool_call_id() == "fast-call")
+        {
+            break;
+        }
+    }
+    control.cancel();
+    assert!(matches!(
+        task.next().await.unwrap(),
+        Err(AgentError::Cancelled)
+    ));
+    drop(task);
+
+    assert_eq!(fast_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(slow_calls.load(Ordering::SeqCst), 1);
+    let results = conversation
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResult(result) => Some(result.tool_call_id()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results, ["fast-call"]);
 }

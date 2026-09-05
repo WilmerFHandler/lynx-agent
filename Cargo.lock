@@ -586,6 +586,7 @@ dependencies = [
 name = "kodkod-anthropic"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "futures-util",
  "kodkod-core",
  "kodkod-http",
@@ -620,6 +621,7 @@ dependencies = [
 name = "kodkod-openai"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "futures-util",
  "kodkod-core",
  "kodkod-http",
@@ -634,6 +636,8 @@ dependencies = [
 name = "kodkod-providers"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
+ "futures-util",
  "kodkod-anthropic",
  "kodkod-core",
  "kodkod-http",

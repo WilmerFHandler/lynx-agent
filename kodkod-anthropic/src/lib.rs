@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use kodkod_core::{
-    AssistantMessage, Conversation, Message, Provider, Retryable, ToolCall, ToolExecutorError,
-    ToolResult, ToolResultOutcome, ToolSpec,
+    AssistantMessage, Conversation, Message, Provider, ProviderEvent, ProviderStream, Retryable,
+    ToolCall, ToolExecutorError, ToolResult, ToolResultOutcome, ToolSpec,
 };
+use kodkod_http::SseDecoder;
 pub use kodkod_http::{
     CredentialError, CredentialFuture, CredentialSource, RequestCredentials, StaticCredentials,
 };
@@ -226,6 +227,334 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
         });
         Ok((message, next))
     }
+
+    fn complete_stream<'a>(
+        &'a self,
+        continuation: &'a AnthropicContinuation,
+        model: &'a M,
+        conversation: &'a Conversation,
+        tools: &'a [ToolSpec],
+    ) -> ProviderStream<'a, AnthropicContinuation, AnthropicError> {
+        Box::pin(async_stream::try_stream! {
+            let credentials = match &self.credentials {
+                Some(source) => Some(source.credentials().await?),
+                None => None,
+            };
+            let mut request = build_request(model.id(), self.max_tokens, conversation, tools, continuation)?;
+            request["stream"] = Value::Bool(true);
+            let mut headers = credentials.map(|credentials| credentials.headers().clone()).unwrap_or_default();
+            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+            let response = self.client.post(&self.messages_url).headers(headers).json(&request).send().await?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = read_limited_body(response, MAX_ERROR_BODY_BYTES).await?;
+                let message = serde_json::from_slice::<Value>(&body).ok()
+                    .and_then(|value| value.pointer("/error/message")?.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| if body.is_empty() { status.to_string() } else { String::from_utf8_lossy(&body).into_owned() });
+                Err(AnthropicError::Api { status: status.as_u16(), message })?;
+                unreachable!("error propagation exits the stream");
+            }
+            if response.headers().get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.split(';').next() == Some("application/json"))
+            {
+                let body: Value = response.json().await?;
+                let stop_reason = body.get("stop_reason").and_then(Value::as_str)
+                    .ok_or_else(|| AnthropicError::Protocol("message response missing stop_reason".into()))?;
+                validate_stop_reason_before_content(stop_reason)?;
+                let content = body.get("content").and_then(Value::as_array).cloned()
+                    .ok_or_else(|| AnthropicError::Protocol("message response missing content".into()))?;
+                let message = parse_content(&content)?;
+                validate_stop_reason(stop_reason, &message)?;
+                let next = checkpoint_anthropic(continuation, model.id(), conversation, message.clone(), content);
+                yield ProviderEvent::Completed(message, next);
+                return;
+            }
+            let mut decoder = SseDecoder::default();
+            let mut accumulator = AnthropicStreamAccumulator::default();
+            let mut bytes = response.bytes_stream();
+            while let Some(chunk) = bytes.next().await {
+                for event in decoder.push(&chunk?).map_err(AnthropicError::Protocol)? {
+                    if let Some(delta) = accumulator.push(&event.data)? {
+                        yield ProviderEvent::TextDelta(delta);
+                    }
+                    if accumulator.finished {
+                        let (message, content) = accumulator.finish()?;
+                        let next = checkpoint_anthropic(continuation, model.id(), conversation, message.clone(), content);
+                        yield ProviderEvent::Completed(message, next);
+                        return;
+                    }
+                }
+            }
+            decoder.finish().map_err(AnthropicError::Protocol)?;
+            Err(AnthropicError::Protocol("message stream ended before message_stop".into()))?;
+        })
+    }
+}
+
+fn checkpoint_anthropic(
+    continuation: &AnthropicContinuation,
+    model: &str,
+    conversation: &Conversation,
+    message: AssistantMessage,
+    content: Vec<Value>,
+) -> AnthropicContinuation {
+    let mut next = continuation.clone();
+    next.checkpoints.push(AnthropicCheckpoint {
+        model: model.to_owned(),
+        assistant_message_index: conversation.messages().len(),
+        assistant: message,
+        content,
+    });
+    next
+}
+
+#[derive(Default)]
+struct AnthropicStreamAccumulator {
+    blocks: Vec<StreamBlock>,
+    stop_reason: Option<String>,
+    finished: bool,
+}
+
+struct StreamBlock {
+    value: Value,
+    stopped: bool,
+}
+
+const MAX_STREAM_CONTENT_BLOCKS: usize = 512;
+
+impl AnthropicStreamAccumulator {
+    fn push(&mut self, data: &str) -> Result<Option<String>, AnthropicError> {
+        if self.finished {
+            return Err(AnthropicError::Protocol(
+                "stream event followed message_stop".into(),
+            ));
+        }
+        let payload: Value = serde_json::from_str(data)?;
+        match payload
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "content_block_start" => {
+                let index = stream_index(&payload)?;
+                if index != self.blocks.len() {
+                    return Err(AnthropicError::Protocol(
+                        "content block indices must be contiguous".into(),
+                    ));
+                }
+                if self.blocks.len() >= MAX_STREAM_CONTENT_BLOCKS {
+                    return Err(AnthropicError::Protocol("too many content blocks".into()));
+                }
+                let value = payload.get("content_block").cloned().ok_or_else(|| {
+                    AnthropicError::Protocol("content block start missing block".into())
+                })?;
+                let object = value.as_object().ok_or_else(|| {
+                    AnthropicError::Protocol("content block must be an object".into())
+                })?;
+                match object.get("type").and_then(Value::as_str) {
+                    Some("text") if object.get("text").is_some_and(Value::is_string) => {}
+                    Some("tool_use")
+                        if object.get("id").is_some_and(Value::is_string)
+                            && object.get("name").is_some_and(Value::is_string) => {}
+                    Some("thinking")
+                        if object.get("thinking").is_some_and(Value::is_string)
+                            && object.get("signature").is_some_and(Value::is_string) => {}
+                    Some("redacted_thinking") => {}
+                    Some(kind) => {
+                        return Err(AnthropicError::Protocol(format!(
+                            "invalid streamed content block: {kind}"
+                        )));
+                    }
+                    None => {
+                        return Err(AnthropicError::Protocol(
+                            "content block missing type".into(),
+                        ));
+                    }
+                }
+                self.blocks.push(StreamBlock {
+                    value,
+                    stopped: false,
+                });
+                Ok(None)
+            }
+            "content_block_delta" => {
+                let index = stream_index(&payload)?;
+                let state = self.blocks.get_mut(index).ok_or_else(|| {
+                    AnthropicError::Protocol("content block delta preceded start".into())
+                })?;
+                if state.stopped {
+                    return Err(AnthropicError::Protocol(
+                        "content block delta followed stop".into(),
+                    ));
+                }
+                let block = &mut state.value;
+                let delta = payload.get("delta").ok_or_else(|| {
+                    AnthropicError::Protocol("content block delta missing delta".into())
+                })?;
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        require_block_type(block, "text", "text_delta")?;
+                        let text = delta.get("text").and_then(Value::as_str).ok_or_else(|| {
+                            AnthropicError::Protocol("text delta missing text".into())
+                        })?;
+                        append_value_string(block, "text", Some(text)).map_err(|_| {
+                            AnthropicError::Protocol("text delta targeted non-text block".into())
+                        })?;
+                        Ok((!text.is_empty()).then(|| text.to_owned()))
+                    }
+                    Some("input_json_delta") => {
+                        require_block_type(block, "tool_use", "input_json_delta")?;
+                        let fragment = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                AnthropicError::Protocol("input delta missing partial_json".into())
+                            })?;
+                        let existing = block
+                            .get("_partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        block["_partial_json"] = Value::String(format!("{existing}{fragment}"));
+                        Ok(None)
+                    }
+                    Some("thinking_delta") => {
+                        require_block_type(block, "thinking", "thinking_delta")?;
+                        append_value_string(
+                            block,
+                            "thinking",
+                            delta.get("thinking").and_then(Value::as_str),
+                        )?;
+                        Ok(None)
+                    }
+                    Some("signature_delta") => {
+                        require_block_type(block, "thinking", "signature_delta")?;
+                        append_value_string(
+                            block,
+                            "signature",
+                            delta.get("signature").and_then(Value::as_str),
+                        )?;
+                        Ok(None)
+                    }
+                    Some(other) => Err(AnthropicError::Protocol(format!(
+                        "unsupported content block delta: {other}"
+                    ))),
+                    None => Err(AnthropicError::Protocol(
+                        "content block delta missing type".into(),
+                    )),
+                }
+            }
+            "content_block_stop" => {
+                let index = stream_index(&payload)?;
+                let state = self.blocks.get_mut(index).ok_or_else(|| {
+                    AnthropicError::Protocol("content block stop preceded start".into())
+                })?;
+                if state.stopped {
+                    return Err(AnthropicError::Protocol(
+                        "duplicate content block stop".into(),
+                    ));
+                }
+                if let Some(fragment) = state
+                    .value
+                    .as_object_mut()
+                    .and_then(|object| object.remove("_partial_json"))
+                {
+                    state.value["input"] =
+                        serde_json::from_str(fragment.as_str().unwrap_or_default())?;
+                }
+                state.stopped = true;
+                Ok(None)
+            }
+            "message_delta" => {
+                if let Some(reason) = payload
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                {
+                    if self
+                        .stop_reason
+                        .as_deref()
+                        .is_some_and(|seen| seen != reason)
+                    {
+                        return Err(AnthropicError::Protocol(
+                            "message stop reason changed".into(),
+                        ));
+                    }
+                    self.stop_reason = Some(reason.to_owned());
+                }
+                Ok(None)
+            }
+            "message_stop" => {
+                if self.blocks.iter().any(|block| !block.stopped) {
+                    return Err(AnthropicError::Protocol(
+                        "message stopped with an open content block".into(),
+                    ));
+                }
+                self.finished = true;
+                Ok(None)
+            }
+            "error" => Err(AnthropicError::Protocol(
+                payload
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown streaming error")
+                    .to_owned(),
+            )),
+            "message_start" | "message_ping" | "ping" => Ok(None),
+            other => Err(AnthropicError::Protocol(format!(
+                "unknown message stream event: {other}"
+            ))),
+        }
+    }
+
+    fn finish(self) -> Result<(AssistantMessage, Vec<Value>), AnthropicError> {
+        let reason = self
+            .stop_reason
+            .ok_or_else(|| AnthropicError::Protocol("message stream missing stop reason".into()))?;
+        validate_stop_reason_before_content(&reason)?;
+        let content = self
+            .blocks
+            .into_iter()
+            .map(|block| block.value)
+            .collect::<Vec<_>>();
+        let message = parse_content(&content)?;
+        validate_stop_reason(&reason, &message)?;
+        Ok((message, content))
+    }
+}
+
+fn require_block_type(block: &Value, expected: &str, delta: &str) -> Result<(), AnthropicError> {
+    if block.get("type").and_then(Value::as_str) == Some(expected) {
+        Ok(())
+    } else {
+        Err(AnthropicError::Protocol(format!(
+            "{delta} targeted incompatible block"
+        )))
+    }
+}
+
+fn stream_index(payload: &Value) -> Result<usize, AnthropicError> {
+    payload
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| AnthropicError::Protocol("stream event missing valid index".into()))
+}
+
+fn append_value_string(
+    block: &mut Value,
+    field: &str,
+    value: Option<&str>,
+) -> Result<(), AnthropicError> {
+    let value = value.ok_or_else(|| AnthropicError::Protocol(format!("delta missing {field}")))?;
+    match block.get_mut(field) {
+        Some(Value::String(target)) => target.push_str(value),
+        _ => {
+            return Err(AnthropicError::Protocol(format!(
+                "{field} delta targeted incompatible block"
+            )));
+        }
+    }
+    Ok(())
 }
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -593,6 +922,51 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "lookup");
     }
 
+    #[tokio::test]
+    async fn streams_only_text_and_checkpoints_signed_thinking_on_message_stop() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"signed\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"draft\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let provider = AnthropicMessagesProvider::<TestModel>::new(format!("{}/v1", server.uri()));
+        let conversation = Conversation::new();
+        let continuation = provider.create_continuation(&TestModel);
+        let mut stream = provider.complete_stream(&continuation, &TestModel, &conversation, &[]);
+        assert!(
+            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::TextDelta(text) if text == "draft")
+        );
+        let ProviderEvent::Completed(message, continuation) = stream.next().await.unwrap().unwrap()
+        else {
+            panic!("expected terminal completion");
+        };
+        assert_eq!(message.content(), "draft");
+        drop(stream);
+
+        let mut history = Conversation::new();
+        history.push_message(Message::Assistant(message));
+        let replay = build_request("claude-test", 1, &history, &[], &continuation).unwrap();
+        assert_eq!(replay["messages"][0]["content"][0]["thinking"], "private");
+        assert_eq!(replay["messages"][0]["content"][0]["signature"], "signed");
+    }
+
     #[test]
     fn groups_parallel_tool_results_into_one_user_message() {
         let mut conversation = Conversation::new();
@@ -686,5 +1060,53 @@ mod tests {
         )]);
         assert!(validate_stop_reason("end_turn", &tool).is_err());
         assert!(validate_stop_reason("future_reason", &text).is_err());
+    }
+
+    #[test]
+    fn stream_rejects_unbounded_invalid_or_incomplete_block_lifecycles() {
+        let mut accumulator = AnthropicStreamAccumulator::default();
+        assert!(accumulator
+            .push(r#"{"type":"content_block_start","index":999999999,"content_block":{"type":"text","text":""}}"#)
+            .is_err());
+        assert!(
+            accumulator
+                .push(r#"{"type":"content_block_start","index":0,"content_block":"scalar"}"#)
+                .is_err()
+        );
+
+        let mut accumulator = AnthropicStreamAccumulator::default();
+        accumulator
+            .push(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"x","name":"f","input":{}}}"#)
+            .unwrap();
+        assert!(accumulator
+            .push(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"wrong"}}"#)
+            .is_err());
+        assert!(accumulator.push(r#"{"type":"message_stop"}"#).is_err());
+
+        let mut accumulator = AnthropicStreamAccumulator::default();
+        accumulator
+            .push(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"x","name":"f","input":{}}}"#)
+            .unwrap();
+        accumulator
+            .push(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"x\"}"}}"#)
+            .unwrap();
+        accumulator
+            .push(r#"{"type":"content_block_stop","index":0}"#)
+            .unwrap();
+        assert!(
+            accumulator
+                .push(r#"{"type":"content_block_stop","index":0}"#)
+                .is_err()
+        );
+        assert!(accumulator
+            .push(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#)
+            .is_err());
+        accumulator
+            .push(r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#)
+            .unwrap();
+        accumulator.push(r#"{"type":"message_stop"}"#).unwrap();
+        assert!(accumulator.push(r#"{"type":"message_stop"}"#).is_err());
+        let (message, _) = accumulator.finish().unwrap();
+        assert_eq!(message.tool_calls()[0].arguments(), &json!({"q":"x"}));
     }
 }

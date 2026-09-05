@@ -20,7 +20,7 @@ pub use agent::{Agent, AgentContext, AgentError, AgentEvent, SteerError, Task, T
 pub use compact::{CompactError, CompactOptions, DEFAULT_KEEP_TAIL_TOKENS, TurnCompaction};
 pub use conversation::Conversation;
 pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
-pub use provider::Provider;
+pub use provider::{Provider, ProviderEvent, ProviderStream};
 pub use retry::{RetryPolicy, RetryProvider, Retryable};
 pub use tool::{
     Tool, ToolCall, ToolError, ToolExecutor, ToolExecutorError, ToolFuture, ToolOutput, ToolResult,

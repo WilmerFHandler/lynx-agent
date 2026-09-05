@@ -1,5 +1,6 @@
 use super::*;
-use kodkod_core::{Conversation, Provider, UserMessage};
+use futures_util::StreamExt;
+use kodkod_core::{Conversation, Provider, ProviderEvent, UserMessage};
 use kodkod_http::{RequestCredentials, StaticCredentials};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::json;
@@ -79,6 +80,35 @@ async fn codex_adds_fresh_account_credentials_and_originator() {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn codex_forwards_responses_text_deltas() {
+    let server = MockServer::start().await;
+    let body = format!(
+        "event: response.output_text.delta\ndata: {}\n\n{}",
+        json!({"type":"response.output_text.delta","delta":"live"}),
+        completed("final")
+    );
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let provider =
+        CodexProvider::<TestCodexModel>::new(Arc::new(FreshCodexAccess(AtomicUsize::new(0))))
+            .unwrap()
+            .with_test_endpoint(server.uri());
+    let model = TestCodexModel;
+    let conversation = Conversation::new();
+    let continuation = provider.create_continuation(&model);
+    let mut stream = provider.complete_stream(&continuation, &model, &conversation, &[]);
+    assert!(
+        matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::TextDelta(text) if text == "live")
+    );
+    assert!(
+        matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(message, _) if message.content() == "final")
+    );
 }
 
 #[test]

@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use kodkod_core::{
-    AssistantMessage, Conversation, Message, Provider, ToolCall, ToolExecutorError, ToolResult,
-    ToolResultOutcome, ToolSpec,
+    AssistantMessage, Conversation, Message, Provider, ProviderEvent, ProviderStream, ToolCall,
+    ToolExecutorError, ToolResult, ToolResultOutcome, ToolSpec,
 };
+use kodkod_http::{SseDecoder, SseEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -130,6 +131,25 @@ where
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
+        let mut stream = self.complete_stream(continuation, model, conversation, tools);
+        while let Some(event) = stream.next().await {
+            if let ProviderEvent::Completed(message, continuation) = event? {
+                return Ok((message, continuation));
+            }
+        }
+        Err(OpenAiError::Protocol(
+            "stream ended without a terminal event".into(),
+        ))
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        continuation: &'a Self::Continuation,
+        model: &'a M,
+        conversation: &'a Conversation,
+        tools: &'a [ToolSpec],
+    ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
+        Box::pin(async_stream::try_stream! {
         let credentials = match &self.credentials {
             Some(source) => Some(source.credentials().await?),
             None => None,
@@ -160,28 +180,43 @@ where
                         body
                     }
                 });
-            return Err(OpenAiError::Api {
+            Err(OpenAiError::Api {
                 status: status.as_u16(),
                 message,
-            });
+            })?;
+            unreachable!("error propagation exits the stream");
         }
 
-        let terminal = read_terminal_response(response).await?;
-        let output = terminal
-            .get("output")
-            .and_then(Value::as_array)
-            .cloned()
-            .ok_or_else(|| OpenAiError::Protocol("completed response missing output".into()))?;
-        let assistant = parse_output(&output)?;
-
-        let mut next = continuation.clone();
-        next.checkpoints.push(ResponseCheckpoint {
-            model: model.id().to_owned(),
-            assistant_message_index: conversation.messages().len(),
-            assistant: assistant.clone(),
-            output,
-        });
-        Ok((assistant, next))
+            let mut bytes = response.bytes_stream();
+            let mut decoder = SseDecoder::default();
+            let mut output = OutputAccumulator::default();
+            while let Some(chunk) = bytes.next().await {
+                for event in decoder.push(&chunk?).map_err(OpenAiError::Protocol)? {
+                    if let Some(delta) = response_text_delta(&event)? {
+                        yield ProviderEvent::TextDelta(delta);
+                    }
+                    if let Some(terminal) = handle_sse_event(event, &mut output)? {
+                        let final_output = terminal
+                            .get("output")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .ok_or_else(|| OpenAiError::Protocol("completed response missing output".into()))?;
+                        let assistant = parse_output(&final_output)?;
+                        let mut next = continuation.clone();
+                        next.checkpoints.push(ResponseCheckpoint {
+                            model: model.id().to_owned(),
+                            assistant_message_index: conversation.messages().len(),
+                            assistant: assistant.clone(),
+                            output: final_output,
+                        });
+                        yield ProviderEvent::Completed(assistant, next);
+                        return;
+                    }
+                }
+            }
+            decoder.finish().map_err(OpenAiError::Protocol)?;
+            Err(OpenAiError::Protocol("stream ended without a terminal event".into()))?;
+        })
     }
 }
 
@@ -327,32 +362,17 @@ fn convert_tool(spec: &ToolSpec) -> Value {
     })
 }
 
-const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_ASSEMBLED_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT_ITEMS: usize = 512;
 
-async fn read_terminal_response(response: reqwest::Response) -> Result<Value, OpenAiError> {
-    let mut stream = response.bytes_stream();
-    let mut decoder = SseDecoder::default();
-    let mut output = OutputAccumulator::default();
-    while let Some(chunk) = stream.next().await {
-        if let Some(terminal) = process_sse_chunk(&mut decoder, &mut output, &chunk?)? {
-            return Ok(terminal);
-        }
-    }
-    decoder.finish()?;
-    Err(OpenAiError::Protocol(
-        "stream ended without a terminal event".into(),
-    ))
-}
-
+#[cfg(test)]
 fn process_sse_chunk(
     decoder: &mut SseDecoder,
     output: &mut OutputAccumulator,
     chunk: &[u8],
 ) -> Result<Option<Value>, OpenAiError> {
-    for event in decoder.push(chunk)? {
+    for event in decoder.push(chunk).map_err(OpenAiError::Protocol)? {
         if let Some(terminal) = handle_sse_event(event, output)? {
             return Ok(Some(terminal));
         }
@@ -375,16 +395,6 @@ async fn read_limited_body(
         }
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-#[derive(Default)]
-struct SseDecoder {
-    buffer: Vec<u8>,
-}
-
-struct SseEvent {
-    event_name: Option<String>,
-    data: String,
 }
 
 #[derive(Default)]
@@ -485,75 +495,13 @@ fn validate_item_identity(
     Ok(())
 }
 
-impl SseDecoder {
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, OpenAiError> {
-        self.buffer.extend_from_slice(chunk);
-        let mut events = Vec::new();
-        while let Some((payload_end, delimiter_end)) = find_event_boundary(&self.buffer) {
-            if payload_end > MAX_SSE_EVENT_BYTES {
-                return Err(OpenAiError::Protocol(
-                    "SSE event exceeded size limit".into(),
-                ));
-            }
-            let payload = self.buffer[..payload_end].to_vec();
-            self.buffer.drain(..delimiter_end);
-            if let Some(event) = parse_sse_block(&payload)? {
-                events.push(event);
-            }
-        }
-        if self.buffer.len() > MAX_SSE_EVENT_BYTES {
-            return Err(OpenAiError::Protocol(
-                "SSE event exceeded size limit".into(),
-            ));
-        }
-        Ok(events)
-    }
-
-    fn finish(&self) -> Result<(), OpenAiError> {
-        if self.buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
-            return Err(OpenAiError::Protocol("truncated SSE event".into()));
-        }
-        Ok(())
-    }
-}
-
-fn find_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    for index in 0..buffer.len() {
-        if buffer.get(index..index + 2) == Some(b"\n\n") {
-            return Some((index, index + 2));
-        }
-        if buffer.get(index..index + 4) == Some(b"\r\n\r\n") {
-            return Some((index, index + 4));
-        }
-    }
-    None
-}
-
-fn parse_sse_block(payload: &[u8]) -> Result<Option<SseEvent>, OpenAiError> {
-    let block = std::str::from_utf8(payload)
-        .map_err(|error| OpenAiError::Protocol(format!("SSE event was not UTF-8: {error}")))?;
-    let mut event_name = None;
-    let mut data = String::new();
-    for line in block.lines() {
-        if let Some(value) = line.strip_prefix("event:") {
-            event_name = Some(value.trim().to_owned());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(value.trim_start());
-        }
-    }
-    if data.is_empty() || data == "[DONE]" {
-        return Ok(None);
-    }
-    Ok(Some(SseEvent { event_name, data }))
-}
-
 fn handle_sse_event(
     event: SseEvent,
     output: &mut OutputAccumulator,
 ) -> Result<Option<Value>, OpenAiError> {
+    if event.data == "[DONE]" {
+        return Ok(None);
+    }
     let payload: Value = serde_json::from_str(&event.data)?;
     let kind = payload
         .get("type")
@@ -599,6 +547,27 @@ fn handle_sse_event(
                 .to_owned();
             Err(OpenAiError::Protocol(message))
         }
+        _ => Ok(None),
+    }
+}
+
+fn response_text_delta(event: &SseEvent) -> Result<Option<String>, OpenAiError> {
+    if event.data == "[DONE]" {
+        return Ok(None);
+    }
+    let payload: Value = serde_json::from_str(&event.data)?;
+    let kind = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .or(event.event_name.as_deref())
+        .unwrap_or_default();
+    match kind {
+        "response.output_text.delta" | "response.refusal.delta" => payload
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| OpenAiError::Protocol(format!("{kind} missing delta"))),
         _ => Ok(None),
     }
 }
@@ -739,7 +708,7 @@ mod tests {
         if let Some(response) = process_sse_chunk(&mut decoder, &mut output, body)? {
             return Ok(response);
         }
-        decoder.finish()?;
+        decoder.finish().map_err(OpenAiError::Protocol)?;
         Err(OpenAiError::Protocol(
             "stream ended without a terminal event".into(),
         ))
@@ -1059,9 +1028,7 @@ mod tests {
     fn decoder_surfaces_truncated_stream_and_terminal_before_finish() {
         let mut decoder = SseDecoder::default();
         decoder.push(b"event: response.created\ndata: {").unwrap();
-        assert!(
-            matches!(decoder.finish(), Err(OpenAiError::Protocol(message)) if message.contains("truncated"))
-        );
+        assert!(matches!(decoder.finish(), Err(message) if message.contains("truncated")));
 
         let terminal = completed(json!([{
             "type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"done"}]

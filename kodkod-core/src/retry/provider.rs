@@ -1,4 +1,6 @@
-use crate::{AssistantMessage, Conversation, Provider, ToolSpec};
+use futures::StreamExt;
+
+use crate::{AssistantMessage, Conversation, Provider, ProviderEvent, ProviderStream, ToolSpec};
 
 use super::{RetryPolicy, Retryable};
 
@@ -79,6 +81,54 @@ where
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        continuation: &'a Self::Continuation,
+        model: &'a Self::Model,
+        conversation: &'a Conversation,
+        tools: &'a [ToolSpec],
+    ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
+        Box::pin(async_stream::try_stream! {
+            let max = self.policy.max_attempts.max(1);
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                let mut stream = self.inner.complete_stream(
+                    continuation,
+                    model,
+                    conversation,
+                    tools,
+                );
+                let mut emitted_text = false;
+                let mut retry = false;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(ProviderEvent::TextDelta(delta)) => {
+                            emitted_text = true;
+                            yield ProviderEvent::TextDelta(delta);
+                        }
+                        Ok(ProviderEvent::Completed(message, continuation)) => {
+                            yield ProviderEvent::Completed(message, continuation);
+                            return;
+                        }
+                        Err(error)
+                            if !emitted_text && error.is_retryable() && attempt < max =>
+                        {
+                            retry = true;
+                            break;
+                        }
+                        Err(error) => Err(error)?,
+                    }
+                }
+                drop(stream);
+                if !retry {
+                    return;
+                }
+                futures_timer::Delay::new(self.policy.backoff_after_attempt(attempt)).await;
+            }
+        })
     }
 }
 
@@ -254,6 +304,92 @@ mod tests {
         drop(completion);
 
         tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct StreamingFailure {
+        calls: Arc<AtomicU32>,
+        fail_after_delta: bool,
+    }
+
+    impl Provider for StreamingFailure {
+        type Model = TestModel;
+        type Error = RetryTestError;
+        type Continuation = ();
+
+        fn create_continuation(&self, _: &TestModel) {}
+        fn supports_vision(&self, _: &TestModel) -> bool {
+            false
+        }
+
+        async fn complete(
+            &self,
+            _: &(),
+            _: &TestModel,
+            _: &Conversation,
+            _: &[ToolSpec],
+        ) -> Result<(AssistantMessage, ()), RetryTestError> {
+            unreachable!()
+        }
+
+        fn complete_stream<'a>(
+            &'a self,
+            _: &'a (),
+            _: &'a TestModel,
+            _: &'a Conversation,
+            _: &'a [ToolSpec],
+        ) -> ProviderStream<'a, (), RetryTestError> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            let fail_after_delta = self.fail_after_delta;
+            Box::pin(async_stream::try_stream! {
+                if fail_after_delta {
+                    yield ProviderEvent::TextDelta("once".into());
+                    Err(RetryTestError::http(503, true))?;
+                } else if attempt == 0 {
+                    Err(RetryTestError::http(503, true))?;
+                } else {
+                    yield ProviderEvent::Completed(AssistantMessage::new("ok"), ());
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_retries_only_before_any_text_is_emitted() {
+        let policy = RetryPolicy {
+            max_attempts: 2,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+            backoff_multiplier: 1.0,
+        };
+        let calls = Arc::new(AtomicU32::new(0));
+        let provider = RetryProvider::with_policy(
+            StreamingFailure {
+                calls: Arc::clone(&calls),
+                fail_after_delta: false,
+            },
+            policy.clone(),
+        );
+        let conversation = Conversation::new();
+        let mut stream = provider.complete_stream(&(), &TestModel, &conversation, &[]);
+        assert!(
+            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(message, ()) if message.content() == "ok")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let provider = RetryProvider::with_policy(
+            StreamingFailure {
+                calls: Arc::clone(&calls),
+                fail_after_delta: true,
+            },
+            policy,
+        );
+        let mut stream = provider.complete_stream(&(), &TestModel, &conversation, &[]);
+        assert!(
+            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::TextDelta(text) if text == "once")
+        );
+        assert!(stream.next().await.unwrap().is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

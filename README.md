@@ -36,6 +36,38 @@ that case.
 
 No provider opens a browser, stores credentials, or performs an OAuth flow.
 
+Applications can render provider text before a round completes by consuming the
+agent task as a stream. Deltas are provisional: replace the preview with the
+`AssistantReply` message, which is the authoritative transcript checkpoint and
+may differ from the concatenated deltas. Complete-only providers emit no deltas,
+so rendering the final reply once also avoids duplicate text. Existing exhaustive
+matches over AgentEvent must add the AssistantTextDelta case.
+
+```rust,ignore
+let mut preview = String::new();
+let mut task = agent.run_turn(&mut conversation, &model, user_message, &control);
+while let Some(event) = task.next().await {
+    match event? {
+        AgentEvent::AssistantTextDelta(delta) => {
+            preview.push_str(&delta);
+            render_preview(&preview);
+        }
+        AgentEvent::AssistantReply(message) => {
+            preview.clear();
+            render_committed(message.content());
+        }
+        _ => {}
+    }
+}
+// Calling `control.cancel()` makes the task return `AgentError::Cancelled`;
+// any displayed preview remains outside the conversation checkpoint.
+```
+
+Parallel tool calls produce ToolFinished in completion order; use each result's
+call ID rather than relying on the original call order. Dropping or cancelling
+a task drops its local in-flight futures, but it cannot reverse an HTTP request
+or tool side effect that already happened.
+
 Refresh the reviewed OpenCode snapshot with
 `python3 scripts/update-open-code-models.py`, inspect the resulting diff, and
 run the provider tests before publishing it. Protocol routing comes from the

@@ -2,10 +2,13 @@ use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+use futures_util::StreamExt;
 use kodkod_anthropic::{
     AnthropicContinuation, AnthropicError, AnthropicMessagesProvider, AnthropicModel,
 };
-use kodkod_core::{AssistantMessage, Conversation, Provider, Retryable, ToolSpec};
+use kodkod_core::{
+    AssistantMessage, Conversation, Provider, ProviderEvent, ProviderStream, Retryable, ToolSpec,
+};
 use kodkod_http::{CredentialSource, RequestCredentials, StaticCredentials};
 use kodkod_openai::{
     OpenAiCompatibleProvider, OpenAiError, OpenAiModel, OpenAiResponsesProvider,
@@ -410,5 +413,67 @@ impl Provider for OpenCodeProvider {
             )
             .into()),
         }
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        continuation: &'a Self::Continuation,
+        model: &'a OpenCodeModel,
+        conversation: &'a Conversation,
+        tools: &'a [ToolSpec],
+    ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
+        Box::pin(async_stream::try_stream! {
+            self.validate_model(model)?;
+            match (model.protocol, continuation) {
+                (Protocol::Responses, OpenCodeContinuation::Responses(continuation)) => {
+                    let provider = OpenAiResponsesProvider::new(&self.endpoint)
+                        .with_credentials(self.credentials(Protocol::Responses))
+                        .with_client(self.client.clone());
+                    let mut stream = provider.complete_stream(continuation, model, conversation, tools);
+                    while let Some(event) = stream.next().await {
+                        match event? {
+                            ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
+                            ProviderEvent::Completed(message, next) => {
+                                yield ProviderEvent::Completed(message, OpenCodeContinuation::Responses(next));
+                                return;
+                            }
+                        }
+                    }
+                }
+                (Protocol::ChatCompletions, OpenCodeContinuation::ChatCompletions) => {
+                    let provider = OpenAiCompatibleProvider::new(&self.endpoint)
+                        .with_credentials(self.credentials(Protocol::ChatCompletions))
+                        .with_client(self.client.clone());
+                    let mut stream = provider.complete_stream(&(), model, conversation, tools);
+                    while let Some(event) = stream.next().await {
+                        match event? {
+                            ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
+                            ProviderEvent::Completed(message, ()) => {
+                                yield ProviderEvent::Completed(message, OpenCodeContinuation::ChatCompletions);
+                                return;
+                            }
+                        }
+                    }
+                }
+                (Protocol::Messages, OpenCodeContinuation::Messages(continuation)) => {
+                    let provider = AnthropicMessagesProvider::new(&self.endpoint)
+                        .with_credentials(self.credentials(Protocol::Messages))
+                        .with_client(self.client.clone());
+                    let mut stream = provider.complete_stream(continuation, model, conversation, tools);
+                    while let Some(event) = stream.next().await {
+                        match event? {
+                            ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
+                            ProviderEvent::Completed(message, next) => {
+                                yield ProviderEvent::Completed(message, OpenCodeContinuation::Messages(next));
+                                return;
+                            }
+                        }
+                    }
+                }
+                _ => Err(ProviderConfigError::new(
+                    "OpenCode continuation protocol does not match the selected model",
+                ))?,
+            }
+        })
     }
 }

@@ -4,6 +4,8 @@ use std::fmt;
 #[derive(Debug)]
 pub enum AgentError<E> {
     Provider(E),
+    /// A provider stream ended without its authoritative completion event.
+    ProviderStreamEnded,
     MaxToolRoundsExceeded {
         max: usize,
     },
@@ -20,6 +22,9 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Provider(error) => write!(f, "provider failed: {error}"),
+            Self::ProviderStreamEnded => {
+                write!(f, "provider stream ended before completing the response")
+            }
             Self::MaxToolRoundsExceeded { max } => {
                 write!(f, "assistant requested tools for more than {max} rounds")
             }
@@ -36,7 +41,10 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Provider(error) => Some(error),
-            Self::MaxToolRoundsExceeded { .. } | Self::Cancelled | Self::ControlAlreadyUsed => None,
+            Self::ProviderStreamEnded
+            | Self::MaxToolRoundsExceeded { .. }
+            | Self::Cancelled
+            | Self::ControlAlreadyUsed => None,
         }
     }
 }

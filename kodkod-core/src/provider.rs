@@ -1,8 +1,28 @@
 use std::error::Error;
 use std::future::Future;
+use std::pin::Pin;
+
+use futures::Stream;
 
 use crate::compact::{CompactError, CompactOptions};
 use crate::{AssistantMessage, Conversation, ToolSpec};
+
+/// Provisional progress and the authoritative result of one provider round.
+pub enum ProviderEvent<C> {
+    /// Text which may be displayed while the request is running. It is not a
+    /// conversation checkpoint and may be followed by an error or cancellation.
+    TextDelta(String),
+    /// The only event whose message and continuation may be committed. This is
+    /// terminal: a provider must emit no events after it.
+    Completed(AssistantMessage, C),
+}
+
+/// A provider response stream. Successful streams end with exactly one
+/// [`ProviderEvent::Completed`] event and emit nothing afterward. Agent
+/// consumers intentionally stop at the first completion, so trailing errors or
+/// events from a nonconforming producer are not observed.
+pub type ProviderStream<'a, C, E> =
+    Pin<Box<dyn Stream<Item = Result<ProviderEvent<C>, E>> + Send + 'a>>;
 
 /// A model provider with an opaque, checkpointed continuation value.
 pub trait Provider: Sync {
@@ -42,6 +62,26 @@ pub trait Provider: Sync {
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), Self::Error>> + Send;
+
+    /// Stream one assistant response and its next continuation checkpoint.
+    ///
+    /// The default keeps complete-only providers source-compatible. Streaming
+    /// providers may emit text deltas, but must emit owned authoritative state
+    /// only in the final `Completed` event and must end immediately afterward.
+    fn complete_stream<'a>(
+        &'a self,
+        continuation: &'a Self::Continuation,
+        model: &'a Self::Model,
+        conversation: &'a Conversation,
+        tools: &'a [ToolSpec],
+    ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
+        let completion = self.complete(continuation, model, conversation, tools);
+        Box::pin(futures::stream::once(async move {
+            completion
+                .await
+                .map(|(message, continuation)| ProviderEvent::Completed(message, continuation))
+        }))
+    }
 
     /// Perform an independent one-round operation with a fresh continuation.
     fn complete_once(

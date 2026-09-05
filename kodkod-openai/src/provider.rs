@@ -1,7 +1,10 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use kodkod_core::{AssistantMessage, Conversation, Provider, ToolSpec};
+use futures_util::StreamExt;
+use kodkod_core::{
+    AssistantMessage, Conversation, Provider, ProviderEvent, ProviderStream, ToolSpec,
+};
 
 use super::completion;
 use super::error::OpenAiError;
@@ -93,12 +96,46 @@ where
         .await
         .map(|message| (message, ()))
     }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _continuation: &'a Self::Continuation,
+        model: &'a M,
+        conversation: &'a Conversation,
+        tools: &'a [ToolSpec],
+    ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
+        Box::pin(async_stream::try_stream! {
+            let credentials = match &self.credentials {
+                Some(source) => Some(source.credentials().await?),
+                None => None,
+            };
+            let mut stream = completion::stream_with_credentials(
+                &self.client,
+                &self.chat_completions_url,
+                credentials.as_ref(),
+                model.id(),
+                conversation,
+                tools,
+            );
+            while let Some(event) = stream.next().await {
+                match event? {
+                    ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
+                    ProviderEvent::Completed(message, ()) => {
+                        yield ProviderEvent::Completed(message, ());
+                        return;
+                    }
+                }
+            }
+            Err(OpenAiError::Protocol("chat completion stream ended without completion".into()))?;
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodkod_core::UserMessage;
+    use futures_util::StreamExt;
+    use kodkod_core::{ProviderEvent, UserMessage};
     use serde_json::json;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -153,5 +190,41 @@ mod tests {
 
         assert_eq!(message.content(), "world");
         assert!(message.tool_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn streams_chat_text_and_requires_done_before_completion() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::<TestModel>::new(format!("{}/v1", server.uri()));
+        let model = TestModel {
+            id: "llama3",
+            vision: false,
+        };
+        let conversation = Conversation::new();
+        let mut stream = provider.complete_stream(&(), &model, &conversation, &[]);
+        assert!(
+            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::TextDelta(text) if text == "hel")
+        );
+        assert!(
+            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::TextDelta(text) if text == "lo")
+        );
+        assert!(
+            matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(message, ()) if message.content() == "hello")
+        );
     }
 }

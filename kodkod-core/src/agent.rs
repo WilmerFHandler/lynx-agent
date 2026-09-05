@@ -8,16 +8,21 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use async_stream::try_stream;
+use futures::StreamExt;
 
 pub use control::{SteerError, TaskControl};
 pub use error::AgentError;
 pub use event::AgentEvent;
 
 /// Streaming events from an [`Agent::run_turn`] call.
+///
+/// Dropping the task drops local provider and tool futures. It cannot undo
+/// external effects already performed by a provider or tool.
 pub type Task<'a, E> = futures::stream::BoxStream<'a, Result<AgentEvent, AgentError<E>>>;
 
 use crate::{
-    CompactError, Conversation, Message, Provider, Tool, ToolExecutor, TurnCompaction, UserMessage,
+    CompactError, Conversation, Message, Provider, ProviderEvent, Tool, ToolExecutor,
+    TurnCompaction, UserMessage,
 };
 
 async fn cancel_or<T>(control: &TaskControl, operation: impl Future<Output = T>) -> Option<T> {
@@ -264,23 +269,33 @@ where
                     Cow::Owned(conversation.without_images())
                 };
 
-                // Cancellation wins when both become ready in one poll.
-                let result = cancel_or(
-                    control,
-                    self.provider.complete(
-                        context.as_ref().expect("agent context exists").continuation(),
-                        model,
-                        &provider_input,
-                        &tool_specs,
-                    ),
-                )
-                .await;
-
-                let (message, next_continuation) = match result {
-                    Some(Ok(completion)) if !control.is_cancelled() => completion,
-                    Some(Ok(_)) | None => Err(AgentError::Cancelled)?,
-                    Some(Err(error)) => Err(AgentError::Provider(error))?,
+                let mut provider_stream = self.provider.complete_stream(
+                    context.as_ref().expect("agent context exists").continuation(),
+                    model,
+                    &provider_input,
+                    &tool_specs,
+                );
+                let (message, next_continuation) = loop {
+                    // Cancellation wins when both become ready in one poll.
+                    let event = cancel_or(control, provider_stream.next()).await;
+                    match event {
+                        Some(Some(Ok(ProviderEvent::TextDelta(delta))))
+                            if !control.is_cancelled() =>
+                        {
+                            yield AgentEvent::AssistantTextDelta(delta);
+                        }
+                        Some(Some(Ok(ProviderEvent::Completed(message, continuation))))
+                            if !control.is_cancelled() =>
+                        {
+                            break (message, continuation);
+                        }
+                        Some(Some(Ok(_))) | None => Err(AgentError::Cancelled)?,
+                        Some(Some(Err(error))) => Err(AgentError::Provider(error))?,
+                        Some(None) => Err(AgentError::ProviderStreamEnded)?,
+                    }
                 };
+                drop(provider_stream);
+                drop(provider_input);
 
                 // The transcript and continuation are one logical checkpoint.
                 // No cancellation check occurs between these operations: once
@@ -309,12 +324,19 @@ where
                 for tool_call in &tool_calls {
                     yield AgentEvent::ToolStarted(tool_call.clone());
                 }
-                let results = futures::future::join_all(tool_calls.iter().map(|tool_call| {
-                    self.tools.execute_for_capabilities(
-                        tool_call, vision_enabled, computer_use_enabled,
-                    )
-                })).await;
-                for result in results {
+                let mut results = futures::stream::FuturesUnordered::new();
+                for tool_call in &tool_calls {
+                    results.push(self.tools.execute_for_capabilities(
+                        tool_call,
+                        vision_enabled,
+                        computer_use_enabled,
+                    ));
+                }
+                while !results.is_empty() {
+                    let Some(result) = cancel_or(control, results.next()).await else {
+                        Err(AgentError::Cancelled)?
+                    };
+                    let Some(result) = result else { break };
                     conversation.push_message(Message::ToolResult(result.clone()));
                     yield AgentEvent::ToolFinished(result);
                 }

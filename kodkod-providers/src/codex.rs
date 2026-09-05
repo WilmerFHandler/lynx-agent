@@ -3,7 +3,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use kodkod_core::{AssistantMessage, Conversation, Provider, ToolSpec};
+use futures_util::StreamExt;
+use kodkod_core::{
+    AssistantMessage, Conversation, Provider, ProviderEvent, ProviderStream, ToolSpec,
+};
 use kodkod_http::{CredentialError, CredentialSource, RequestCredentials};
 use kodkod_openai::{OpenAiError, OpenAiModel, OpenAiResponsesProvider, ResponsesContinuation};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
@@ -124,6 +127,28 @@ where
         self.inner()
             .complete(continuation, model, conversation, tools)
             .await
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        continuation: &'a Self::Continuation,
+        model: &'a M,
+        conversation: &'a Conversation,
+        tools: &'a [ToolSpec],
+    ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
+        Box::pin(async_stream::try_stream! {
+            let inner = self.inner();
+            let mut stream = inner.complete_stream(continuation, model, conversation, tools);
+            while let Some(event) = stream.next().await {
+                match event? {
+                    ProviderEvent::TextDelta(delta) => yield ProviderEvent::TextDelta(delta),
+                    ProviderEvent::Completed(message, continuation) => {
+                        yield ProviderEvent::Completed(message, continuation);
+                        return;
+                    }
+                }
+            }
+        })
     }
 }
 
