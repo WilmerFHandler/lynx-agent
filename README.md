@@ -5,26 +5,19 @@ owns login, refresh policy, secure storage, and account selection; provider
 crates ask a `kodkod_http::CredentialSource` for HTTP headers immediately before
 each request.
 
-```rust
-use std::sync::Arc;
-use kodkod::http::{CredentialFuture, CredentialSource, RequestCredentials};
-use kodkod::openai::OpenAiResponsesProvider;
+Enable the facade's `providers` feature for the reusable named services. A
+`CodexProvider` fixes the ChatGPT Codex endpoint and adds the bearer, account,
+and originator headers from a fresh `CodexCredentialSource`; the application
+still owns login, refresh, account state, and storage. `OpenCodeProvider` fixes
+the Go or Zen endpoint, adds its session and user-agent headers, and routes a
+model through Responses, Chat Completions, or Messages according to the bundled
+reviewed catalog.
 
-struct AppCredentials;
-
-impl CredentialSource for AppCredentials {
-    fn credentials(&self) -> CredentialFuture<'_> {
-        Box::pin(async {
-            // Obtain a currently valid token from the application-owned session.
-            RequestCredentials::bearer("current-token")
-        })
-    }
-}
-
-let provider = OpenAiResponsesProvider::<MyModel>::new("https://api.openai.com/v1")
-    .with_credentials(Arc::new(AppCredentials));
-# struct MyModel;
-```
+See [`kodkod-providers/examples/provider_setup.rs`](kodkod-providers/examples/provider_setup.rs)
+for a standalone, compile-checked example covering Codex, OpenCode Go, and a
+custom endpoint. The custom protocol adapters remain available as
+`kodkod::openai` and `kodkod::anthropic`, while an application with different
+transport needs can implement the core `kodkod::Provider` trait directly.
 
 `kodkod-openai` provides the existing OpenAI-compatible Chat Completions
 adapter and an HTTP/SSE Responses adapter. Responses requests use stateless
@@ -42,3 +35,9 @@ caller edits or truncates their bound history; create a fresh continuation in
 that case.
 
 No provider opens a browser, stores credentials, or performs an OAuth flow.
+
+Refresh the reviewed OpenCode snapshot with
+`python3 scripts/update-open-code-models.py`, inspect the resulting diff, and
+run the provider tests before publishing it. Protocol routing comes from the
+official OpenCode endpoint tables and vision metadata comes from models.dev;
+unknown models are not guessed.

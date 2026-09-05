@@ -10,3 +10,6 @@ pub use kodkod_openai as openai;
 
 #[cfg(feature = "anthropic")]
 pub use kodkod_anthropic as anthropic;
+
+#[cfg(feature = "providers")]
+pub use kodkod_providers as providers;

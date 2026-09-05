@@ -1,3 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["kodkod", "kodkod-core", "kodkod-http", "kodkod-openai", "kodkod-anthropic"]
+members = [
+    "kodkod",
+    "kodkod-core",
+    "kodkod-http",
+    "kodkod-openai",
+    "kodkod-anthropic",
+    "kodkod-providers",
+]

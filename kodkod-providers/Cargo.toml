@@ -1,0 +1,22 @@
+[package]
+name = "kodkod-providers"
+version = "0.1.0"
+edition = "2024"
+description = "Named Codex and OpenCode providers for Kodkod."
+license = "MIT"
+repository = "https://github.com/WilmerFHandler/kodkod"
+keywords = ["agent", "llm", "codex", "opencode"]
+categories = ["asynchronous"]
+
+[dependencies]
+kodkod-core = { path = "../kodkod-core", version = "0.1.0" }
+kodkod-http = { path = "../kodkod-http", version = "0.1.0" }
+kodkod-openai = { path = "../kodkod-openai", version = "0.1.0" }
+kodkod-anthropic = { path = "../kodkod-anthropic", version = "0.1.0" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
