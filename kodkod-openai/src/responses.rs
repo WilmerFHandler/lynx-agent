@@ -105,6 +105,10 @@ where
         model.supports_vision()
     }
 
+    fn supports_document(&self, model: &M, mime: &str) -> bool {
+        supports_inline_document(mime) && (mime != "application/pdf" || model.supports_vision())
+    }
+
     fn create_continuation(&self, _model: &M) -> Self::Continuation {
         ResponsesContinuation::default()
     }
@@ -150,6 +154,7 @@ where
         tools: &'a [ToolSpec],
     ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
         Box::pin(async_stream::try_stream! {
+        validate_documents(conversation, model.supports_vision())?;
         let credentials = match &self.credentials {
             Some(source) => Some(source.credentials().await?),
             None => None,
@@ -228,6 +233,7 @@ fn build_request(
     continuation: &ResponsesContinuation,
 ) -> Result<Value, OpenAiError> {
     validate_continuation(model, conversation, continuation)?;
+    validate_document_mime_types(conversation)?;
     let checkpoints: BTreeMap<usize, &ResponseCheckpoint> = continuation
         .checkpoints
         .iter()
@@ -300,6 +306,13 @@ fn convert_message(message: &Message) -> Vec<Value> {
             content.extend(user.images().iter().map(|image| {
                 json!({"type": "input_image", "image_url": image.to_data_url(), "detail": "auto"})
             }));
+            content.extend(user.documents().iter().map(|document| {
+                json!({
+                    "type": "input_file",
+                    "filename": document.filename(),
+                    "file_data": document.to_data_url(),
+                })
+            }));
             vec![json!({"role": "user", "content": content})]
         }
         Message::Assistant(assistant) => {
@@ -320,6 +333,84 @@ fn convert_message(message: &Message) -> Vec<Value> {
         }
         Message::ToolResult(result) => convert_tool_result(result),
     }
+}
+
+fn supports_inline_document(mime: &str) -> bool {
+    matches!(
+        mime,
+        "application/pdf"
+            | "text/plain"
+            | "text/markdown"
+            | "text/csv"
+            | "text/tab-separated-values"
+            | "text/html"
+            | "text/xml"
+            | "application/json"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/msword"
+            | "application/rtf"
+            | "text/rtf"
+            | "application/vnd.oasis.opendocument.text"
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            | "application/vnd.ms-powerpoint"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "application/vnd.ms-excel"
+            | "application/csv"
+    )
+}
+
+const MAX_INLINE_DOCUMENT_BYTES: usize = 50 * 1024 * 1024;
+
+fn validate_documents(
+    conversation: &Conversation,
+    supports_vision: bool,
+) -> Result<(), OpenAiError> {
+    validate_document_mime_types(conversation)?;
+    let mut total_bytes = 0usize;
+    for message in conversation.messages() {
+        if let Message::User(user) = message {
+            if !supports_vision
+                && user
+                    .documents()
+                    .iter()
+                    .any(|document| document.mime() == "application/pdf")
+            {
+                return Err(OpenAiError::UnsupportedDocument {
+                    provider: "OpenAI Responses",
+                    mime: "application/pdf".to_owned(),
+                });
+            }
+            for document in user.documents() {
+                total_bytes = total_bytes.saturating_add(document.data().len());
+                if document.data().len() >= MAX_INLINE_DOCUMENT_BYTES
+                    || total_bytes > MAX_INLINE_DOCUMENT_BYTES
+                {
+                    return Err(OpenAiError::DocumentLimitExceeded {
+                        provider: "OpenAI Responses",
+                        limit_bytes: MAX_INLINE_DOCUMENT_BYTES,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_document_mime_types(conversation: &Conversation) -> Result<(), OpenAiError> {
+    for message in conversation.messages() {
+        if let Message::User(user) = message
+            && let Some(document) = user
+                .documents()
+                .iter()
+                .find(|document| !supports_inline_document(document.mime()))
+        {
+            return Err(OpenAiError::UnsupportedDocument {
+                provider: "OpenAI Responses",
+                mime: document.mime().to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn convert_tool_result(result: &ToolResult) -> Vec<Value> {
@@ -651,7 +742,7 @@ fn required_string(item: &Value, field: &str) -> Result<String, OpenAiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodkod_core::{Image, UserMessage};
+    use kodkod_core::{Document, Image, UserMessage};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1072,5 +1163,58 @@ mod tests {
             parse_output(&[json!({"type":"function_call", "call_id":"x", "name":"f"})]).is_err()
         );
         assert!(parse_output(&[json!({"type":"future_action", "id":"x"})]).is_err());
+    }
+
+    #[test]
+    fn serializes_inline_document_as_responses_input_file() {
+        let mut conversation = Conversation::new();
+        conversation.push_user_message(UserMessage::new("summarize").with_documents(vec![
+            Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+        ]));
+
+        let request = build_request(
+            "gpt-test",
+            None,
+            &conversation,
+            &[],
+            &ResponsesContinuation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request["input"][0]["content"][1],
+            json!({
+                "type": "input_file",
+                "filename": "notes.pdf",
+                "file_data": "data:application/pdf;base64,JVBERg==",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_documents_before_a_responses_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let provider = OpenAiResponsesProvider::<TestModel>::new(format!("{}/v1", server.uri()));
+        let mut conversation = Conversation::new();
+        conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+            Document::try_new("application/zip", "notes.zip", b"PK").unwrap(),
+        ]));
+
+        let error = provider
+            .complete_once(&TestModel, &conversation, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OpenAiError::UnsupportedDocument { provider: "OpenAI Responses", mime }
+                if mime == "application/zip"
+        ));
+        server.verify().await;
     }
 }

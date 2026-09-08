@@ -50,7 +50,7 @@ pub async fn complete_with_credentials(
     conversation: &Conversation,
     tools: &[ToolSpec],
 ) -> Result<AssistantMessage, OpenAiError> {
-    let request = build_request(model_id, conversation, tools);
+    let request = build_request(model_id, conversation, tools)?;
     let mut http_request = client.post(chat_completions_url).json(&request);
 
     if let Some(credentials) = credentials {
@@ -84,7 +84,7 @@ pub(crate) fn stream_with_credentials<'a>(
     tools: &'a [ToolSpec],
 ) -> ProviderStream<'a, (), OpenAiError> {
     Box::pin(async_stream::try_stream! {
-        let mut request = serde_json::to_value(build_request(model_id, conversation, tools))?;
+        let mut request = serde_json::to_value(build_request(model_id, conversation, tools)?)?;
         request["stream"] = Value::Bool(true);
         let mut http_request = client.post(chat_completions_url).json(&request);
         if let Some(credentials) = credentials {

@@ -231,6 +231,19 @@ where
                     yield AgentEvent::Steered(user);
                 }
 
+                if let Some(document) = conversation.messages().iter().find_map(|message| {
+                    let Message::User(user) = message else {
+                        return None;
+                    };
+                    user.documents()
+                        .iter()
+                        .find(|document| !self.provider.supports_document(model, document.mime()))
+                }) {
+                    Err(AgentError::UnsupportedDocument {
+                        mime: document.mime().to_owned(),
+                    })?;
+                }
+
                 if let Some(compaction) = compaction.filter(|_| control.take_compact_request()) {
                     yield AgentEvent::CompactionStarted;
                     let result = match cancel_or(

@@ -8,11 +8,24 @@ use crate::CredentialError;
 #[derive(Debug)]
 pub enum OpenAiError {
     Http(reqwest::Error),
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+    },
     Json(serde_json::Error),
     EmptyResponse,
     Credentials(CredentialError),
-    Incomplete { reason: String },
+    UnsupportedDocument {
+        provider: &'static str,
+        mime: String,
+    },
+    DocumentLimitExceeded {
+        provider: &'static str,
+        limit_bytes: usize,
+    },
+    Incomplete {
+        reason: String,
+    },
     Protocol(String),
 }
 
@@ -24,6 +37,21 @@ impl fmt::Display for OpenAiError {
             Self::Json(error) => write!(f, "failed to parse response: {error}"),
             Self::EmptyResponse => f.write_str("chat completion returned no choices"),
             Self::Credentials(error) => write!(f, "credentials unavailable: {error}"),
+            Self::UnsupportedDocument { provider, mime } => {
+                write!(
+                    f,
+                    "{provider} does not support inline documents with MIME type {mime}"
+                )
+            }
+            Self::DocumentLimitExceeded {
+                provider,
+                limit_bytes,
+            } => {
+                write!(
+                    f,
+                    "{provider} inline documents exceed the {limit_bytes}-byte request limit"
+                )
+            }
             Self::Incomplete { reason } => write!(f, "response incomplete: {reason}"),
             Self::Protocol(message) => write!(f, "response protocol error: {message}"),
         }
@@ -67,6 +95,8 @@ impl Retryable for OpenAiError {
             Self::Json(_)
             | Self::EmptyResponse
             | Self::Credentials(_)
+            | Self::UnsupportedDocument { .. }
+            | Self::DocumentLimitExceeded { .. }
             | Self::Incomplete { .. }
             | Self::Protocol(_) => false,
         }

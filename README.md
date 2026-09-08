@@ -34,6 +34,26 @@ returning tool calls. Both stateful adapters reject continuations after the
 caller edits or truncates their bound history; create a fresh continuation in
 that case.
 
+Documents are immutable inline bytes owned by a `UserMessage`; there is no
+provider upload lifecycle yet. Build them from the MIME type, safe display
+filename, and bytes, then ask the selected provider whether that model accepts
+the MIME type before submitting a turn:
+
+```rust
+use kodkod_core::{Document, UserMessage};
+
+let document = Document::try_new("application/pdf", "report.pdf", pdf_bytes)?;
+let message = UserMessage::new("Summarize this report.").with_documents(vec![document]);
+```
+
+The direct OpenAI Responses adapter accepts reviewed inline file types; PDFs
+require a vision-capable model, while text and common office formats are sent as
+text-extracted files. The native Anthropic Messages adapter accepts PDFs on
+vision-capable models and UTF-8 `text/plain` documents. Generic OpenAI-compatible
+Chat Completions, Codex subscription routing, and OpenCode deliberately report
+no document capability until their service contracts are reviewed, so they reject
+attached documents before credentials or HTTP are used.
+
 No provider opens a browser, stores credentials, or performs an OAuth flow.
 
 Applications can render provider text before a round completes by consuming the

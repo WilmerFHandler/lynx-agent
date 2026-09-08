@@ -7,7 +7,8 @@ use kodkod_anthropic::{
     AnthropicContinuation, AnthropicError, AnthropicMessagesProvider, AnthropicModel,
 };
 use kodkod_core::{
-    AssistantMessage, Conversation, Provider, ProviderEvent, ProviderStream, Retryable, ToolSpec,
+    AssistantMessage, Conversation, Message, Provider, ProviderEvent, ProviderStream, Retryable,
+    ToolSpec,
 };
 use kodkod_http::{CredentialSource, RequestCredentials, StaticCredentials};
 use kodkod_openai::{
@@ -381,6 +382,7 @@ impl Provider for OpenCodeProvider {
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
+        reject_documents(conversation)?;
         self.validate_model(model)?;
         match (model.protocol, continuation) {
             (Protocol::Responses, OpenCodeContinuation::Responses(continuation)) => {
@@ -423,6 +425,7 @@ impl Provider for OpenCodeProvider {
         tools: &'a [ToolSpec],
     ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
         Box::pin(async_stream::try_stream! {
+            reject_documents(conversation)?;
             self.validate_model(model)?;
             match (model.protocol, continuation) {
                 (Protocol::Responses, OpenCodeContinuation::Responses(continuation)) => {
@@ -476,4 +479,18 @@ impl Provider for OpenCodeProvider {
             }
         })
     }
+}
+
+fn reject_documents(conversation: &Conversation) -> Result<(), ProviderConfigError> {
+    for message in conversation.messages() {
+        if let Message::User(user) = message
+            && let Some(document) = user.documents().first()
+        {
+            return Err(ProviderConfigError::new(format!(
+                "OpenCode does not support inline documents with MIME type {}",
+                document.mime()
+            )));
+        }
+    }
+    Ok(())
 }

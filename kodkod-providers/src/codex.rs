@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use kodkod_core::{
-    AssistantMessage, Conversation, Provider, ProviderEvent, ProviderStream, ToolSpec,
+    AssistantMessage, Conversation, Message, Provider, ProviderEvent, ProviderStream, ToolSpec,
 };
 use kodkod_http::{CredentialError, CredentialSource, RequestCredentials};
 use kodkod_openai::{OpenAiError, OpenAiModel, OpenAiResponsesProvider, ResponsesContinuation};
@@ -124,6 +124,7 @@ where
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
+        reject_documents(conversation)?;
         self.inner()
             .complete(continuation, model, conversation, tools)
             .await
@@ -137,6 +138,7 @@ where
         tools: &'a [ToolSpec],
     ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
         Box::pin(async_stream::try_stream! {
+            reject_documents(conversation)?;
             let inner = self.inner();
             let mut stream = inner.complete_stream(continuation, model, conversation, tools);
             while let Some(event) = stream.next().await {
@@ -150,6 +152,20 @@ where
             }
         })
     }
+}
+
+fn reject_documents(conversation: &Conversation) -> Result<(), OpenAiError> {
+    for message in conversation.messages() {
+        if let Message::User(user) = message
+            && let Some(document) = user.documents().first()
+        {
+            return Err(OpenAiError::UnsupportedDocument {
+                provider: "Codex subscription Responses",
+                mime: document.mime().to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 struct CodexHttpCredentials {

@@ -53,6 +53,10 @@ where
         self.inner.supports_vision(model)
     }
 
+    fn supports_document(&self, model: &Self::Model, mime: &str) -> bool {
+        self.inner.supports_document(model, mime)
+    }
+
     fn supports_computer_use(&self, model: &Self::Model) -> bool {
         self.inner.supports_computer_use(model)
     }

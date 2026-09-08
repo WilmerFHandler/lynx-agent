@@ -136,6 +136,11 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
     fn supports_vision(&self, model: &M) -> bool {
         model.supports_vision()
     }
+
+    fn supports_document(&self, model: &M, mime: &str) -> bool {
+        mime == "text/plain" || (mime == "application/pdf" && model.supports_vision())
+    }
+
     fn create_continuation(&self, _model: &M) -> Self::Continuation {
         AnthropicContinuation::default()
     }
@@ -164,10 +169,7 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, AnthropicContinuation), AnthropicError> {
-        let credentials = match &self.credentials {
-            Some(source) => Some(source.credentials().await?),
-            None => None,
-        };
+        validate_documents(conversation, model.supports_vision())?;
         let request = build_request(
             model.id(),
             self.max_tokens,
@@ -175,6 +177,11 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
             tools,
             continuation,
         )?;
+        validate_request_size(&request)?;
+        let credentials = match &self.credentials {
+            Some(source) => Some(source.credentials().await?),
+            None => None,
+        };
         let mut headers = credentials
             .map(|credentials| credentials.headers().clone())
             .unwrap_or_default();
@@ -236,12 +243,14 @@ impl<M: AnthropicModel> Provider for AnthropicMessagesProvider<M> {
         tools: &'a [ToolSpec],
     ) -> ProviderStream<'a, AnthropicContinuation, AnthropicError> {
         Box::pin(async_stream::try_stream! {
+            validate_documents(conversation, model.supports_vision())?;
+            let mut request = build_request(model.id(), self.max_tokens, conversation, tools, continuation)?;
+            request["stream"] = Value::Bool(true);
+            validate_request_size(&request)?;
             let credentials = match &self.credentials {
                 Some(source) => Some(source.credentials().await?),
                 None => None,
             };
-            let mut request = build_request(model.id(), self.max_tokens, conversation, tools, continuation)?;
-            request["stream"] = Value::Bool(true);
             let mut headers = credentials.map(|credentials| credentials.headers().clone()).unwrap_or_default();
             headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
             let response = self.client.post(&self.messages_url).headers(headers).json(&request).send().await?;
@@ -558,6 +567,16 @@ fn append_value_string(
 }
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+
+fn validate_request_size(request: &Value) -> Result<(), AnthropicError> {
+    if serde_json::to_vec(request)?.len() > MAX_REQUEST_BYTES {
+        return Err(AnthropicError::RequestLimitExceeded {
+            limit_bytes: MAX_REQUEST_BYTES,
+        });
+    }
+    Ok(())
+}
 
 async fn read_limited_body(
     response: reqwest::Response,
@@ -619,6 +638,7 @@ fn build_request(
     continuation: &AnthropicContinuation,
 ) -> Result<Value, AnthropicError> {
     validate_continuation(model, conversation, continuation)?;
+    validate_document_mime_types(conversation)?;
     let mut messages = Vec::new();
     let mut system_messages = conversation
         .system_prompt()
@@ -657,7 +677,7 @@ fn build_request(
                 index += 1;
             }
             message => {
-                messages.push(convert_message(message));
+                messages.push(convert_message(message)?);
                 index += 1;
             }
         }
@@ -708,15 +728,18 @@ fn validate_continuation(
     Ok(())
 }
 
-fn convert_message(message: &Message) -> Value {
+fn convert_message(message: &Message) -> Result<Value, AnthropicError> {
     match message {
         Message::User(user) => {
             let mut content = Vec::new();
+            for document in user.documents() {
+                content.push(document_block(document)?);
+            }
             for image in user.images() {
                 content.push(image_block(image));
             }
             content.push(json!({"type":"text", "text":user.content()}));
-            json!({"role":"user", "content":content})
+            Ok(json!({"role":"user", "content":content}))
         }
         Message::Assistant(assistant) => {
             let mut content = Vec::new();
@@ -728,9 +751,70 @@ fn convert_message(message: &Message) -> Value {
                     "type":"tool_use", "id":call.id(), "name":call.name(), "input":call.arguments()
                 })
             }));
-            json!({"role":"assistant", "content":content})
+            Ok(json!({"role":"assistant", "content":content}))
         }
         Message::System(_) | Message::ToolResult(_) => unreachable!(),
+    }
+}
+
+fn validate_documents(
+    conversation: &Conversation,
+    supports_vision: bool,
+) -> Result<(), AnthropicError> {
+    validate_document_mime_types(conversation)?;
+    if !supports_vision
+        && conversation.messages().iter().any(|message| {
+            matches!(message, Message::User(user) if user.documents().iter().any(|document| document.mime() == "application/pdf"))
+        })
+    {
+        return Err(AnthropicError::UnsupportedDocument {
+            mime: "application/pdf".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_document_mime_types(conversation: &Conversation) -> Result<(), AnthropicError> {
+    for message in conversation.messages() {
+        if let Message::User(user) = message
+            && let Some(document) = user
+                .documents()
+                .iter()
+                .find(|document| !matches!(document.mime(), "application/pdf" | "text/plain"))
+        {
+            return Err(AnthropicError::UnsupportedDocument {
+                mime: document.mime().to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn document_block(document: &kodkod_core::Document) -> Result<Value, AnthropicError> {
+    match document.mime() {
+        "application/pdf" => {
+            let data_url = document.to_data_url();
+            let data = data_url
+                .split_once(',')
+                .map(|(_, data)| data)
+                .unwrap_or_default();
+            Ok(json!({"type":"document", "source":{
+                "type":"base64", "media_type":"application/pdf", "data":data
+            }}))
+        }
+        "text/plain" => {
+            let data = std::str::from_utf8(document.data()).map_err(|_| {
+                AnthropicError::InvalidDocumentText {
+                    filename: document.filename().to_owned(),
+                }
+            })?;
+            Ok(json!({"type":"document", "source":{
+                "type":"text", "media_type":"text/plain", "data":data
+            }}))
+        }
+        mime => Err(AnthropicError::UnsupportedDocument {
+            mime: mime.to_owned(),
+        }),
     }
 }
 
@@ -811,6 +895,9 @@ pub enum AnthropicError {
     Http(reqwest::Error),
     Json(serde_json::Error),
     Credentials(CredentialError),
+    UnsupportedDocument { mime: String },
+    InvalidDocumentText { filename: String },
+    RequestLimitExceeded { limit_bytes: usize },
     Api { status: u16, message: String },
     Incomplete { reason: String },
     Protocol(String),
@@ -822,6 +909,21 @@ impl fmt::Display for AnthropicError {
             Self::Http(error) => write!(f, "http request failed: {error}"),
             Self::Json(error) => write!(f, "failed to parse response: {error}"),
             Self::Credentials(error) => write!(f, "credentials unavailable: {error}"),
+            Self::UnsupportedDocument { mime } => {
+                write!(
+                    f,
+                    "Anthropic Messages does not support inline documents with MIME type {mime}"
+                )
+            }
+            Self::InvalidDocumentText { filename } => {
+                write!(f, "text/plain document {filename:?} is not valid UTF-8")
+            }
+            Self::RequestLimitExceeded { limit_bytes } => {
+                write!(
+                    f,
+                    "Anthropic Messages request exceeds the {limit_bytes}-byte limit"
+                )
+            }
             Self::Api { status, message } => write!(f, "api error ({status}): {message}"),
             Self::Incomplete { reason } => write!(f, "message incomplete: {reason}"),
             Self::Protocol(message) => write!(f, "messages protocol error: {message}"),
@@ -866,7 +968,7 @@ impl Retryable for AnthropicError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodkod_core::{Image, UserMessage};
+    use kodkod_core::{Document, Image, UserMessage};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1108,5 +1210,68 @@ mod tests {
         assert!(accumulator.push(r#"{"type":"message_stop"}"#).is_err());
         let (message, _) = accumulator.finish().unwrap();
         assert_eq!(message.tool_calls()[0].arguments(), &json!({"q":"x"}));
+    }
+
+    #[test]
+    fn serializes_pdf_and_plain_text_documents_as_native_blocks() {
+        let mut conversation = Conversation::new();
+        conversation.push_user_message(UserMessage::new("summarize").with_documents(vec![
+            Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+            Document::try_new("text/plain", "notes.txt", b"hello").unwrap(),
+        ]));
+
+        let request = build_request(
+            "claude-test",
+            10,
+            &conversation,
+            &[],
+            &AnthropicContinuation::default(),
+        )
+        .unwrap();
+        let content = &request["messages"][0]["content"];
+        assert_eq!(
+            content[0],
+            json!({"type":"document", "source":{
+                "type":"base64", "media_type":"application/pdf", "data":"JVBERg=="
+            }})
+        );
+        assert_eq!(
+            content[1],
+            json!({"type":"document", "source":{
+                "type":"text", "media_type":"text/plain", "data":"hello"
+            }})
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_unrepresentable_documents_before_an_anthropic_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let provider = AnthropicMessagesProvider::<TestModel>::new(format!("{}/v1", server.uri()));
+        let mut conversation = Conversation::new();
+        conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+            Document::try_new("text/plain", "broken.txt", [0xff]).unwrap(),
+        ]));
+
+        let error = provider
+            .complete_once(&TestModel, &conversation, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AnthropicError::InvalidDocumentText { filename } if filename == "broken.txt"
+        ));
+        let continuation = AnthropicContinuation::default();
+        let mut stream = provider.complete_stream(&continuation, &TestModel, &conversation, &[]);
+        assert!(matches!(
+            futures_util::StreamExt::next(&mut stream).await.unwrap(),
+            Err(AnthropicError::InvalidDocumentText { .. })
+        ));
+        server.verify().await;
     }
 }

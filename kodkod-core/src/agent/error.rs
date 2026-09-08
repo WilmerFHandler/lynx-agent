@@ -9,6 +9,10 @@ pub enum AgentError<E> {
     MaxToolRoundsExceeded {
         max: usize,
     },
+    /// The selected model does not accept one of the conversation documents.
+    UnsupportedDocument {
+        mime: String,
+    },
     /// The caller requested cancellation via [`TaskControl`](super::TaskControl).
     Cancelled,
     /// The one-execution control was cancelled or previously used.
@@ -28,6 +32,12 @@ where
             Self::MaxToolRoundsExceeded { max } => {
                 write!(f, "assistant requested tools for more than {max} rounds")
             }
+            Self::UnsupportedDocument { mime } => {
+                write!(
+                    f,
+                    "selected model does not support document MIME type {mime}"
+                )
+            }
             Self::Cancelled => write!(f, "agent run was cancelled"),
             Self::ControlAlreadyUsed => write!(f, "task control was cancelled or already used"),
         }
@@ -43,6 +53,7 @@ where
             Self::Provider(error) => Some(error),
             Self::ProviderStreamEnded
             | Self::MaxToolRoundsExceeded { .. }
+            | Self::UnsupportedDocument { .. }
             | Self::Cancelled
             | Self::ControlAlreadyUsed => None,
         }

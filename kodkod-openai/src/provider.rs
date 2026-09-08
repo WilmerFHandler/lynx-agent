@@ -135,7 +135,7 @@ where
 mod tests {
     use super::*;
     use futures_util::StreamExt;
-    use kodkod_core::{ProviderEvent, UserMessage};
+    use kodkod_core::{Document, ProviderEvent, UserMessage};
     use serde_json::json;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -226,5 +226,44 @@ mod tests {
         assert!(
             matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(message, ()) if message.content() == "hello")
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_documents_before_chat_completion_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatibleProvider::<TestModel>::new(format!("{}/v1", server.uri()));
+        let model = TestModel {
+            id: "llama3",
+            vision: false,
+        };
+        let mut conversation = Conversation::new();
+        conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+            Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+        ]));
+
+        let error = provider
+            .complete_once(&model, &conversation, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OpenAiError::UnsupportedDocument {
+                provider: "OpenAI-compatible Chat Completions",
+                mime
+            } if mime == "application/pdf"
+        ));
+
+        let mut stream = provider.complete_stream(&(), &model, &conversation, &[]);
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(OpenAiError::UnsupportedDocument { .. })
+        ));
+        server.verify().await;
     }
 }

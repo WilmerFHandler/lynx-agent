@@ -1,6 +1,9 @@
 use crate::{Conversation, Message, ToolResultOutcome, ToolSpec};
 
 const IMAGE_TOKENS: u64 = 2_000;
+// Compressed document bytes do not reveal the extracted text or page count.
+// This is a sizing hint only; providers report authoritative context usage.
+const DOCUMENT_TOKENS: u64 = 8_000;
 pub(crate) const BASE_OVERHEAD_TOKENS: u64 = 256;
 const MESSAGE_OVERHEAD_TOKENS: u64 = 16;
 
@@ -19,6 +22,7 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
         Message::User(message) => {
             tokens += text_tokens(message.content().len());
             tokens += message.images().len() as u64 * IMAGE_TOKENS;
+            tokens += message.documents().len() as u64 * DOCUMENT_TOKENS;
         }
         Message::Assistant(message) => {
             tokens += text_tokens(message.content().len());
@@ -61,8 +65,8 @@ pub(crate) fn estimate_conversation(conversation: &Conversation, tools: &[ToolSp
 mod tests {
     use super::*;
     use crate::{
-        AssistantMessage, Image, SystemMessage, ToolCall, ToolError, ToolExecutorError, ToolResult,
-        UserMessage,
+        AssistantMessage, Document, Image, SystemMessage, ToolCall, ToolError, ToolExecutorError,
+        ToolResult, UserMessage,
     };
     use serde_json::json;
 
@@ -99,6 +103,20 @@ mod tests {
                 .with_images(vec![Image::new("image/png", vec![0x89, 0x50])]),
         ));
         assert!(with_image.estimate_tokens(&[]) > text_only.estimate_tokens(&[]));
+    }
+
+    #[test]
+    fn documents_increase_estimate_without_deriving_pages_from_bytes() {
+        let mut text_only = Conversation::new();
+        text_only.push_message(Message::User(UserMessage::new("summarize")));
+        let mut with_document = Conversation::new();
+        with_document.push_message(Message::User(UserMessage::new("summarize").with_documents(
+            vec![Document::try_new("application/pdf", "notes.pdf", b"%PDF-compressed").unwrap()],
+        )));
+        assert_eq!(
+            with_document.estimate_tokens(&[]) - text_only.estimate_tokens(&[]),
+            DOCUMENT_TOKENS
+        );
     }
 
     #[test]

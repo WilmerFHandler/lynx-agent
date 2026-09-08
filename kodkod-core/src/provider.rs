@@ -33,6 +33,14 @@ pub trait Provider: Sync {
 
     fn supports_vision(&self, model: &Self::Model) -> bool;
 
+    /// Whether this model accepts an inline document with the given MIME type.
+    ///
+    /// The default is deliberately false: providers must opt in per model and
+    /// MIME type before an agent will submit document bytes.
+    fn supports_document(&self, _model: &Self::Model, _mime: &str) -> bool {
+        false
+    }
+
     /// Whether the model is explicitly supported for computer-use tools.
     fn supports_computer_use(&self, _model: &Self::Model) -> bool {
         false

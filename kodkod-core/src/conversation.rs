@@ -43,7 +43,7 @@ impl Conversation {
         self.messages.is_empty()
     }
 
-    /// Append a user message verbatim (preserves `steered`, images, etc.).
+    /// Append a user message verbatim (preserves `steered`, images, documents, etc.).
     pub fn push_user_message(&mut self, user: UserMessage) {
         self.messages.push(Message::User(user));
     }
@@ -67,6 +67,7 @@ impl Conversation {
                     Message::User(user) => Message::User(
                         UserMessage::new(user.content())
                             .with_images(Vec::new())
+                            .with_documents(user.documents().to_vec())
                             .with_steered(user.steered()),
                     ),
                     Message::ToolResult(result) => Message::ToolResult(result.without_images()),
@@ -104,12 +105,15 @@ mod tests {
 
     #[test]
     fn without_images_strips_attachments() {
-        use crate::{Image, ToolOutput, ToolResult};
+        use crate::{Document, Image, ToolOutput, ToolResult};
 
         let mut conv = Conversation::new();
         conv.push_user_message(
             UserMessage::new("describe")
-                .with_images(vec![Image::new("image/png", vec![0x89, 0x50])]),
+                .with_images(vec![Image::new("image/png", vec![0x89, 0x50])])
+                .with_documents(vec![
+                    Document::try_new("text/plain", "notes.txt", b"notes").unwrap(),
+                ]),
         );
         conv.push_message(Message::ToolResult(ToolResult::success(
             "call_1",
@@ -119,7 +123,9 @@ mod tests {
         let stripped = conv.without_images();
         assert!(matches!(
             stripped.messages().first(),
-            Some(Message::User(user)) if user.content() == "describe" && user.images().is_empty()
+            Some(Message::User(user)) if user.content() == "describe"
+                && user.images().is_empty()
+                && user.documents().len() == 1
         ));
         assert!(matches!(
             stripped.messages().get(1),

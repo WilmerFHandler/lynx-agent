@@ -14,7 +14,8 @@ pub(crate) fn build_request(
     model_id: &str,
     conversation: &Conversation,
     tools: &[ToolSpec],
-) -> ChatCompletionRequest {
+) -> Result<ChatCompletionRequest, OpenAiError> {
+    validate_documents(conversation)?;
     let mut messages = Vec::new();
 
     if let Some(system) = conversation.system_prompt() {
@@ -63,11 +64,11 @@ pub(crate) fn build_request(
         message_index += 1;
     }
 
-    ChatCompletionRequest {
+    Ok(ChatCompletionRequest {
         model: model_id.to_owned(),
         messages,
         tools: tools.iter().map(convert_tool_spec).collect(),
-    }
+    })
 }
 
 pub(crate) fn parse_assistant_message(
@@ -134,6 +135,20 @@ fn convert_message(message: &Message) -> RequestMessage {
         },
         Message::ToolResult(_) => unreachable!("tool result groups are converted by build_request"),
     }
+}
+
+fn validate_documents(conversation: &Conversation) -> Result<(), OpenAiError> {
+    for message in conversation.messages() {
+        if let Message::User(user) = message
+            && let Some(document) = user.documents().first()
+        {
+            return Err(OpenAiError::UnsupportedDocument {
+                provider: "OpenAI-compatible Chat Completions",
+                mime: document.mime().to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn convert_tool_call(call: &ToolCall) -> WireToolCall {
@@ -217,7 +232,7 @@ mod tests {
             json!({"temp": 72}),
         )));
 
-        let request = build_request("gpt-4o", &conversation, &[]);
+        let request = build_request("gpt-4o", &conversation, &[]).unwrap();
         assert_eq!(request.model, "gpt-4o");
         assert_eq!(request.messages.len(), 4);
 
@@ -241,7 +256,7 @@ mod tests {
             UserMessage::new("what is this?").with_images(vec![Image::new("image/png", b"abc")]),
         );
 
-        let request = build_request("gpt-4o", &conversation, &[]);
+        let request = build_request("gpt-4o", &conversation, &[]).unwrap();
         let serialized = serde_json::to_value(&request).expect("request should serialize");
         let parts = &serialized["messages"][0]["content"];
 
@@ -277,7 +292,7 @@ mod tests {
                 .with_images(vec![Image::new("image/png", b"def")]),
         )));
 
-        let request = build_request("gpt-4o", &conversation, &[]);
+        let request = build_request("gpt-4o", &conversation, &[]).unwrap();
         let serialized = serde_json::to_value(request).unwrap();
         assert_eq!(serialized["messages"][0]["role"], "assistant");
         assert_eq!(serialized["messages"][1]["role"], "tool");

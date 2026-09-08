@@ -19,7 +19,9 @@ mod estimate;
 pub use agent::{Agent, AgentContext, AgentError, AgentEvent, SteerError, Task, TaskControl};
 pub use compact::{CompactError, CompactOptions, DEFAULT_KEEP_TAIL_TOKENS, TurnCompaction};
 pub use conversation::Conversation;
-pub use message::{AssistantMessage, Image, Message, SystemMessage, UserMessage};
+pub use message::{
+    AssistantMessage, Document, DocumentError, Image, Message, SystemMessage, UserMessage,
+};
 pub use provider::{Provider, ProviderEvent, ProviderStream};
 pub use retry::{RetryPolicy, RetryProvider, Retryable};
 pub use tool::{

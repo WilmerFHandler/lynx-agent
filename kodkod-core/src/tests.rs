@@ -14,10 +14,10 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
-    Agent, AgentError, AgentEvent, AssistantMessage, CompactOptions, Conversation, Image, Message,
-    Provider, ProviderEvent, ProviderStream, TaskControl, Tool, ToolCall, ToolError, ToolExecutor,
-    ToolExecutorError, ToolFuture, ToolResult, ToolResultOutcome, ToolSpec, TurnCompaction,
-    UserMessage,
+    Agent, AgentError, AgentEvent, AssistantMessage, CompactOptions, Conversation, Document, Image,
+    Message, Provider, ProviderEvent, ProviderStream, TaskControl, Tool, ToolCall, ToolError,
+    ToolExecutor, ToolExecutorError, ToolFuture, ToolResult, ToolResultOutcome, ToolSpec,
+    TurnCompaction, UserMessage,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +35,7 @@ impl Error for TestError {}
 struct TestModel {
     vision: bool,
     computer_use: bool,
+    documents: bool,
 }
 
 impl TestModel {
@@ -42,6 +43,7 @@ impl TestModel {
         Self {
             vision: false,
             computer_use: false,
+            documents: false,
         }
     }
 
@@ -49,6 +51,7 @@ impl TestModel {
         Self {
             vision: true,
             computer_use: false,
+            documents: false,
         }
     }
 
@@ -56,6 +59,7 @@ impl TestModel {
         Self {
             vision: true,
             computer_use: true,
+            documents: false,
         }
     }
 
@@ -65,6 +69,18 @@ impl TestModel {
 
     fn computer_use(&self) -> bool {
         self.computer_use
+    }
+
+    const fn with_documents() -> Self {
+        Self {
+            vision: false,
+            computer_use: false,
+            documents: true,
+        }
+    }
+
+    fn documents(&self) -> bool {
+        self.documents
     }
 }
 
@@ -78,6 +94,7 @@ fn conversation_has_images(conversation: &Conversation) -> bool {
 #[derive(Default)]
 struct RecordingProvider {
     seen_tool_names: Arc<Mutex<Vec<String>>>,
+    seen_documents: Arc<Mutex<Vec<Vec<Document>>>>,
 }
 
 impl Provider for RecordingProvider {
@@ -91,6 +108,10 @@ impl Provider for RecordingProvider {
         model.vision()
     }
 
+    fn supports_document(&self, model: &TestModel, mime: &str) -> bool {
+        model.documents() && mime == "text/plain"
+    }
+
     fn supports_computer_use(&self, model: &TestModel) -> bool {
         model.computer_use()
     }
@@ -99,7 +120,7 @@ impl Provider for RecordingProvider {
         &self,
         _state: &Self::Continuation,
         _model: &TestModel,
-        _conversation: &Conversation,
+        conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> impl Future<Output = Result<(AssistantMessage, Self::Continuation), TestError>> + Send
     {
@@ -107,6 +128,17 @@ impl Provider for RecordingProvider {
             .lock()
             .unwrap()
             .extend(tools.iter().map(|tool| tool.name().to_owned()));
+        self.seen_documents.lock().unwrap().push(
+            conversation
+                .messages()
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(user) => Some(user.documents().to_vec()),
+                    _ => None,
+                })
+                .flatten()
+                .collect(),
+        );
 
         ready(Ok((AssistantMessage::new("done"), ())))
     }
@@ -651,6 +683,77 @@ fn agent_strips_images_based_on_provider_vision_support() {
     ))
     .unwrap();
     assert_eq!(saw_images.lock().unwrap().as_slice(), &[false, true]);
+}
+
+#[test]
+fn agent_rejects_unsupported_documents_from_conversation_history() {
+    let agent = Agent::new(RecordingProvider::default());
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("summarize the notes").with_documents(vec![
+        Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+    ]));
+
+    let error = block_on(collect_events(
+        &agent,
+        &mut conversation,
+        "continue",
+        &TestModel::new(),
+    ))
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AgentError::UnsupportedDocument { mime } if mime == "application/pdf"
+    ));
+}
+
+#[test]
+fn agent_allows_documents_supported_by_the_selected_model() {
+    let provider = RecordingProvider::default();
+    let seen_documents = provider.seen_documents.clone();
+    let agent = Agent::new(provider);
+    let mut conversation = Conversation::new();
+    let document = Document::try_new("text/plain", "notes.txt", b"notes").unwrap();
+    conversation.push_user_message(
+        UserMessage::new("summarize the notes").with_documents(vec![document.clone()]),
+    );
+
+    let events = block_on(collect_events(
+        &agent,
+        &mut conversation,
+        "continue",
+        &TestModel::with_documents(),
+    ))
+    .unwrap();
+
+    assert!(matches!(events.last(), Some(AgentEvent::Completed(_))));
+    assert_eq!(seen_documents.lock().unwrap().as_slice(), &[vec![document]]);
+}
+
+#[test]
+fn agent_rejects_unsupported_steered_documents_before_a_provider_round() {
+    let agent = Agent::new(RecordingProvider::default());
+    let mut conversation = Conversation::new();
+    let control = TaskControl::new();
+    let model = TestModel::new();
+    let stream = agent.run_turn(
+        &mut conversation,
+        &model,
+        UserMessage::new("start"),
+        &control,
+    );
+    control
+        .steer(UserMessage::new("also summarize this").with_documents(vec![
+            Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+        ]))
+        .unwrap();
+
+    let events = block_on(stream.collect::<Vec<_>>());
+    assert!(matches!(
+        events.as_slice(),
+        [Ok(AgentEvent::Steered(_)), Err(AgentError::UnsupportedDocument { mime })]
+            if mime == "application/pdf"
+    ));
 }
 
 async fn collect_events<P>(

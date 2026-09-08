@@ -1,6 +1,6 @@
 use super::*;
 use futures_util::StreamExt;
-use kodkod_core::{Conversation, Provider, ProviderEvent, UserMessage};
+use kodkod_core::{Conversation, Document, Provider, ProviderEvent, UserMessage};
 use kodkod_http::{RequestCredentials, StaticCredentials};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::json;
@@ -109,6 +109,42 @@ async fn codex_forwards_responses_text_deltas() {
     assert!(
         matches!(stream.next().await.unwrap().unwrap(), ProviderEvent::Completed(message, _) if message.content() == "final")
     );
+}
+
+#[tokio::test]
+async fn codex_rejects_documents_before_credentials_or_http() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let accesses = Arc::new(FreshCodexAccess(AtomicUsize::new(0)));
+    let provider = CodexProvider::<TestCodexModel>::new(accesses.clone())
+        .unwrap()
+        .with_test_endpoint(server.uri());
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+        Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+    ]));
+
+    let error = provider
+        .complete_once(&TestCodexModel, &conversation, &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        kodkod_openai::OpenAiError::UnsupportedDocument { .. }
+    ));
+    let continuation = provider.create_continuation(&TestCodexModel);
+    let mut stream = provider.complete_stream(&continuation, &TestCodexModel, &conversation, &[]);
+    assert!(matches!(
+        stream.next().await.unwrap(),
+        Err(kodkod_openai::OpenAiError::UnsupportedDocument { .. })
+    ));
+    assert_eq!(accesses.0.load(Ordering::SeqCst), 0);
+    server.verify().await;
 }
 
 #[test]
@@ -243,6 +279,43 @@ async fn open_code_rejects_a_model_from_the_other_service_before_http() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("belongs to OpenCode"));
+}
+
+#[tokio::test]
+async fn open_code_rejects_documents_before_http() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let provider =
+        OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "session", "Lynx/1")
+            .unwrap()
+            .with_test_endpoint(server.uri());
+    let model = open_code_model(OpenCodeService::Go, "gpt-5.6-luna").unwrap();
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+        Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+    ]));
+
+    let error = provider
+        .complete_once(model, &conversation, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not support inline documents")
+    );
+    let continuation = provider.create_continuation(model);
+    let mut stream = provider.complete_stream(&continuation, model, &conversation, &[]);
+    assert!(matches!(
+        stream.next().await.unwrap(),
+        Err(ProviderError::Configuration(_))
+    ));
+    server.verify().await;
 }
 
 #[tokio::test]

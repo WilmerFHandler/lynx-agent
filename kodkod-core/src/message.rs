@@ -1,4 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 use std::sync::Arc;
 
 use crate::{ToolCall, ToolResult};
@@ -77,6 +78,195 @@ impl<'de> Deserialize<'de> for Image {
     }
 }
 
+/// A document attachment in a user message.
+///
+/// Documents carry inline bytes only. Applications own persistence and any
+/// provider-side upload lifecycle; providers decide which media types they can
+/// send.
+#[derive(Clone)]
+pub struct Document {
+    inner: Arc<DocumentData>,
+}
+
+#[derive(Debug)]
+struct DocumentData {
+    mime: String,
+    filename: String,
+    data: Vec<u8>,
+}
+
+impl Document {
+    /// Construct a validated inline document.
+    pub fn try_new(
+        mime: impl Into<String>,
+        filename: impl Into<String>,
+        data: impl Into<Vec<u8>>,
+    ) -> Result<Self, DocumentError> {
+        let mime = mime.into();
+        let filename = filename.into();
+        let data = data.into();
+        validate_mime(&mime)?;
+        validate_filename(&filename)?;
+        if data.is_empty() {
+            return Err(DocumentError::EmptyData);
+        }
+        Ok(Self {
+            inner: Arc::new(DocumentData {
+                mime,
+                filename,
+                data,
+            }),
+        })
+    }
+
+    pub fn mime(&self) -> &str {
+        &self.inner.mime
+    }
+
+    pub fn filename(&self) -> &str {
+        &self.inner.filename
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.inner.data
+    }
+
+    /// Encode the document as a base64 data URL for providers with inline file input.
+    pub fn to_data_url(&self) -> String {
+        format!(
+            "data:{};base64,{}",
+            self.mime(),
+            base64_bytes::encode(self.data())
+        )
+    }
+}
+
+impl fmt::Debug for Document {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Document")
+            .field("mime", &self.mime())
+            .field("filename", &self.filename())
+            .field("byte_len", &self.data().len())
+            .finish()
+    }
+}
+
+impl PartialEq for Document {
+    fn eq(&self, other: &Self) -> bool {
+        self.mime() == other.mime()
+            && self.filename() == other.filename()
+            && self.data() == other.data()
+    }
+}
+
+impl Eq for Document {}
+
+impl Serialize for Document {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        DocumentRef {
+            mime: self.mime(),
+            filename: self.filename(),
+            data: self.data(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Document {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let document = DocumentWire::deserialize(deserializer)?;
+        Self::try_new(document.mime, document.filename, document.data)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentError {
+    EmptyMime,
+    InvalidMime,
+    EmptyFilename,
+    InvalidFilename,
+    EmptyData,
+}
+
+impl fmt::Display for DocumentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyMime => f.write_str("document MIME type is empty"),
+            Self::InvalidMime => f.write_str("document MIME type must be a valid type/subtype"),
+            Self::EmptyFilename => f.write_str("document filename is empty"),
+            Self::InvalidFilename => {
+                f.write_str("document filename must not contain a path or control character")
+            }
+            Self::EmptyData => f.write_str("document data is empty"),
+        }
+    }
+}
+
+impl std::error::Error for DocumentError {}
+
+#[derive(Serialize)]
+struct DocumentRef<'a> {
+    mime: &'a str,
+    filename: &'a str,
+    #[serde(with = "base64_bytes")]
+    data: &'a [u8],
+}
+
+#[derive(Deserialize)]
+struct DocumentWire {
+    mime: String,
+    filename: String,
+    #[serde(with = "base64_bytes")]
+    data: Vec<u8>,
+}
+
+fn validate_mime(mime: &str) -> Result<(), DocumentError> {
+    if mime.trim().is_empty() {
+        return Err(DocumentError::EmptyMime);
+    }
+    let Some((kind, subtype)) = mime.split_once('/') else {
+        return Err(DocumentError::InvalidMime);
+    };
+    if kind.is_empty()
+        || subtype.is_empty()
+        || subtype.contains('/')
+        || !kind.bytes().all(is_mime_token)
+        || !subtype.bytes().all(is_mime_token)
+    {
+        return Err(DocumentError::InvalidMime);
+    }
+    Ok(())
+}
+
+fn is_mime_token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
+        )
+}
+
+fn validate_filename(filename: &str) -> Result<(), DocumentError> {
+    if filename.trim().is_empty() {
+        return Err(DocumentError::EmptyFilename);
+    }
+    if matches!(filename, "." | "..")
+        || filename
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+    {
+        return Err(DocumentError::InvalidFilename);
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct ImageRef<'a> {
     mime: &'a str,
@@ -96,6 +286,8 @@ pub struct UserMessage {
     content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     images: Vec<Image>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    documents: Vec<Document>,
     /// Whether this was injected mid-turn via steering rather than starting a new turn.
     #[serde(default, skip_serializing_if = "is_false")]
     steered: bool,
@@ -106,12 +298,18 @@ impl UserMessage {
         Self {
             content: content.into(),
             images: Vec::new(),
+            documents: Vec::new(),
             steered: false,
         }
     }
 
     pub fn with_images(mut self, images: Vec<Image>) -> Self {
         self.images = images;
+        self
+    }
+
+    pub fn with_documents(mut self, documents: Vec<Document>) -> Self {
+        self.documents = documents;
         self
     }
 
@@ -127,6 +325,10 @@ impl UserMessage {
 
     pub fn images(&self) -> &[Image] {
         &self.images
+    }
+
+    pub fn documents(&self) -> &[Document] {
+        &self.documents
     }
 
     pub fn steered(&self) -> bool {
@@ -322,5 +524,62 @@ mod tests {
             serde_json::json!({"mime": "image/png", "data": "iVA="})
         );
         assert_eq!(serde_json::from_value::<Image>(encoded).unwrap(), image);
+    }
+
+    #[test]
+    fn document_clones_share_the_immutable_payload() {
+        let document = Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap();
+        let clone = document.clone();
+
+        assert!(Arc::ptr_eq(&document.inner, &clone.inner));
+        assert_eq!(
+            document.to_data_url(),
+            "data:application/pdf;base64,JVBERg=="
+        );
+        assert_eq!(
+            format!("{document:?}"),
+            r#"Document { mime: "application/pdf", filename: "notes.pdf", byte_len: 4 }"#
+        );
+    }
+
+    #[test]
+    fn document_serialization_round_trips_validated_fields() {
+        let document = Document::try_new("text/plain", "notes.txt", b"hello").unwrap();
+        let encoded = serde_json::to_value(&document).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"mime": "text/plain", "filename": "notes.txt", "data": "aGVsbG8="})
+        );
+        assert_eq!(
+            serde_json::from_value::<Document>(encoded).unwrap(),
+            document
+        );
+    }
+
+    #[test]
+    fn document_rejects_invalid_metadata_and_empty_bytes() {
+        assert_eq!(
+            Document::try_new("", "notes.txt", b"hello").unwrap_err(),
+            DocumentError::EmptyMime
+        );
+        assert_eq!(
+            Document::try_new("text plain", "notes.txt", b"hello").unwrap_err(),
+            DocumentError::InvalidMime
+        );
+        assert_eq!(
+            Document::try_new("text/plain", "../notes.txt", b"hello").unwrap_err(),
+            DocumentError::InvalidFilename
+        );
+        assert_eq!(
+            Document::try_new("text/plain", "notes.txt", Vec::new()).unwrap_err(),
+            DocumentError::EmptyData
+        );
+    }
+
+    #[test]
+    fn document_deserialization_applies_constructor_validation() {
+        let encoded =
+            serde_json::json!({"mime": "text/plain", "filename": ".", "data": "aGVsbG8="});
+        assert!(serde_json::from_value::<Document>(encoded).is_err());
     }
 }

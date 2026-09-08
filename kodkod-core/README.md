@@ -110,6 +110,10 @@ let agent = Agent::new(RetryProvider::new(EchoProvider));
 ```
 
 `Conversation::estimate_tokens` is a tokenizer-free request-size heuristic.
+Inline documents use `Document::try_new(mime, filename, bytes)` and
+`UserMessage::with_documents`. They stay in the application-owned conversation
+as validated bytes; a provider must opt in to each MIME type with
+`Provider::supports_document` before an agent submits them.
 `Provider::compact` is a default method: it sends the dropped prefix (including
 any earlier summary) to `complete_once` and returns a new conversation that keeps
 the system prompt, the latest user plus later steers, and a recent protocol-safe
