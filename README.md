@@ -49,10 +49,20 @@ let message = UserMessage::new("Summarize this report.").with_documents(vec![doc
 The direct OpenAI Responses adapter accepts reviewed inline file types; PDFs
 require a vision-capable model, while text and common office formats are sent as
 text-extracted files. The native Anthropic Messages adapter accepts PDFs on
-vision-capable models and UTF-8 `text/plain` documents. Generic OpenAI-compatible
-Chat Completions, Codex subscription routing, and OpenCode deliberately report
-no document capability until their service contracts are reviewed, so they reject
-attached documents before credentials or HTTP are used.
+vision-capable models and UTF-8 `text/plain` documents. OpenAI-compatible Chat
+Completions accepts PDF inputs on vision-capable models when its base URL is the
+exact official `https://api.openai.com/v1` endpoint, or when a compatible gateway
+is explicitly enabled with `OpenAiCompatibleProvider::with_pdf_inputs(true)`.
+Those requests use the documented inline `file` part. Each PDF must be under
+50 MiB and the aggregate raw payload may be at most 50 MiB; failures occur
+before credentials are acquired.
+
+OpenCode accepts PDFs only for vision-capable catalog models marked with a PDF
+capability, then routes them through that model's documented Responses, Chat
+Completions, or Messages protocol. Other OpenCode file types remain unsupported.
+Codex subscription routing continues to reject documents because native file
+inputs have not been verified for this subscription endpoint; this does not make
+a claim about every ChatGPT backend surface.
 
 No provider opens a browser, stores credentials, or performs an OAuth flow.
 
@@ -91,5 +101,6 @@ or tool side effect that already happened.
 Refresh the reviewed OpenCode snapshot with
 `python3 scripts/update-open-code-models.py`, inspect the resulting diff, and
 run the provider tests before publishing it. Protocol routing comes from the
-official OpenCode endpoint tables and vision metadata comes from models.dev;
-unknown models are not guessed.
+official OpenCode endpoint tables, while vision and PDF metadata are frozen from
+the 2026-09-08 `https://models.dev/api.json` snapshot; unknown models are not
+guessed.

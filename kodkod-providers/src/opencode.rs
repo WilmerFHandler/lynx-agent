@@ -47,6 +47,7 @@ pub struct OpenCodeModel {
     name: String,
     protocol: Protocol,
     vision: bool,
+    pdf: bool,
 }
 
 impl OpenCodeModel {
@@ -68,6 +69,10 @@ impl OpenCodeModel {
 
     pub const fn supports_vision(&self) -> bool {
         self.vision
+    }
+
+    pub const fn supports_pdf(&self) -> bool {
+        self.pdf
     }
 }
 
@@ -92,6 +97,9 @@ impl AnthropicModel for OpenCodeModel {
 }
 
 /// The reviewed OpenCode catalog bundled with this crate.
+///
+/// PDF capability is a frozen 2026-09-08 snapshot of
+/// <https://models.dev/api.json>; it is independent of vision capability.
 pub fn open_code_catalog() -> &'static [OpenCodeModel] {
     #[derive(Deserialize)]
     struct CatalogEntry {
@@ -100,6 +108,7 @@ pub fn open_code_catalog() -> &'static [OpenCodeModel] {
         name: String,
         protocol: Protocol,
         vision: bool,
+        pdf: bool,
     }
 
     static MODELS: OnceLock<Vec<OpenCodeModel>> = OnceLock::new();
@@ -113,6 +122,7 @@ pub fn open_code_catalog() -> &'static [OpenCodeModel] {
                 name: entry.name,
                 protocol: entry.protocol,
                 vision: entry.vision,
+                pdf: entry.pdf,
             })
             .collect()
     })
@@ -351,6 +361,13 @@ impl Provider for OpenCodeProvider {
         model.supports_vision()
     }
 
+    fn supports_document(&self, model: &OpenCodeModel, mime: &str) -> bool {
+        model.service == self.service
+            && model.supports_pdf()
+            && model.supports_vision()
+            && mime == "application/pdf"
+    }
+
     fn create_continuation(&self, model: &OpenCodeModel) -> Self::Continuation {
         match model.protocol {
             Protocol::Responses => OpenCodeContinuation::Responses(Default::default()),
@@ -382,8 +399,8 @@ impl Provider for OpenCodeProvider {
         conversation: &Conversation,
         tools: &[ToolSpec],
     ) -> Result<(AssistantMessage, Self::Continuation), Self::Error> {
-        reject_documents(conversation)?;
         self.validate_model(model)?;
+        self.validate_documents(model, conversation)?;
         match (model.protocol, continuation) {
             (Protocol::Responses, OpenCodeContinuation::Responses(continuation)) => {
                 let provider = OpenAiResponsesProvider::new(&self.endpoint)
@@ -396,6 +413,7 @@ impl Provider for OpenCodeProvider {
             }
             (Protocol::ChatCompletions, OpenCodeContinuation::ChatCompletions) => {
                 let provider = OpenAiCompatibleProvider::new(&self.endpoint)
+                    .with_pdf_inputs(model.supports_pdf())
                     .with_credentials(self.credentials(Protocol::ChatCompletions))
                     .with_client(self.client.clone());
                 let (message, ()) = provider.complete(&(), model, conversation, tools).await?;
@@ -425,8 +443,8 @@ impl Provider for OpenCodeProvider {
         tools: &'a [ToolSpec],
     ) -> ProviderStream<'a, Self::Continuation, Self::Error> {
         Box::pin(async_stream::try_stream! {
-            reject_documents(conversation)?;
             self.validate_model(model)?;
+            self.validate_documents(model, conversation)?;
             match (model.protocol, continuation) {
                 (Protocol::Responses, OpenCodeContinuation::Responses(continuation)) => {
                     let provider = OpenAiResponsesProvider::new(&self.endpoint)
@@ -445,6 +463,7 @@ impl Provider for OpenCodeProvider {
                 }
                 (Protocol::ChatCompletions, OpenCodeContinuation::ChatCompletions) => {
                     let provider = OpenAiCompatibleProvider::new(&self.endpoint)
+                        .with_pdf_inputs(model.supports_pdf())
                         .with_credentials(self.credentials(Protocol::ChatCompletions))
                         .with_client(self.client.clone());
                     let mut stream = provider.complete_stream(&(), model, conversation, tools);
@@ -481,16 +500,24 @@ impl Provider for OpenCodeProvider {
     }
 }
 
-fn reject_documents(conversation: &Conversation) -> Result<(), ProviderConfigError> {
-    for message in conversation.messages() {
-        if let Message::User(user) = message
-            && let Some(document) = user.documents().first()
-        {
-            return Err(ProviderConfigError::new(format!(
-                "OpenCode does not support inline documents with MIME type {}",
-                document.mime()
-            )));
+impl OpenCodeProvider {
+    fn validate_documents(
+        &self,
+        model: &OpenCodeModel,
+        conversation: &Conversation,
+    ) -> Result<(), ProviderConfigError> {
+        for message in conversation.messages() {
+            if let Message::User(user) = message {
+                for document in user.documents() {
+                    if !self.supports_document(model, document.mime()) {
+                        return Err(ProviderConfigError::new(format!(
+                            "OpenCode does not support inline documents with MIME type {}",
+                            document.mime()
+                        )));
+                    }
+                }
+            }
         }
+        Ok(())
     }
-    Ok(())
 }

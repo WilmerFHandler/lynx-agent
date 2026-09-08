@@ -5,8 +5,9 @@ use kodkod_core::{
 use serde_json::Value;
 
 use super::api::{
-    ChatCompletionRequest, ChatCompletionResponse, ContentPart, FunctionDefinition, ImageUrl,
-    RequestMessage, ToolCallKind, ToolDefinition, ToolDefinitionKind, UserContent, WireToolCall,
+    ChatCompletionRequest, ChatCompletionResponse, ContentPart, FileInput, FunctionDefinition,
+    ImageUrl, RequestMessage, ToolCallKind, ToolDefinition, ToolDefinitionKind, UserContent,
+    WireToolCall,
 };
 use super::error::OpenAiError;
 
@@ -14,8 +15,9 @@ pub(crate) fn build_request(
     model_id: &str,
     conversation: &Conversation,
     tools: &[ToolSpec],
+    pdf_allowed: bool,
 ) -> Result<ChatCompletionRequest, OpenAiError> {
-    validate_documents(conversation)?;
+    validate_documents(conversation, pdf_allowed)?;
     let mut messages = Vec::new();
 
     if let Some(system) = conversation.system_prompt() {
@@ -105,7 +107,8 @@ fn convert_message(message: &Message) -> RequestMessage {
         },
         Message::User(user) => {
             let images = user.images();
-            let content = if images.is_empty() {
+            let documents = user.documents();
+            let content = if images.is_empty() && documents.is_empty() {
                 UserContent::Text(user.content().to_owned())
             } else {
                 let mut parts = vec![ContentPart::Text {
@@ -114,6 +117,12 @@ fn convert_message(message: &Message) -> RequestMessage {
                 parts.extend(images.iter().map(|image| ContentPart::ImageUrl {
                     image_url: ImageUrl {
                         url: image.to_data_url(),
+                    },
+                }));
+                parts.extend(documents.iter().map(|document| ContentPart::File {
+                    file: FileInput {
+                        filename: document.filename().to_owned(),
+                        file_data: document.to_data_url(),
                     },
                 }));
                 UserContent::Parts(parts)
@@ -137,15 +146,32 @@ fn convert_message(message: &Message) -> RequestMessage {
     }
 }
 
-fn validate_documents(conversation: &Conversation) -> Result<(), OpenAiError> {
+const MAX_INLINE_DOCUMENT_BYTES: usize = 50 * 1024 * 1024;
+
+pub(crate) fn validate_documents(
+    conversation: &Conversation,
+    pdf_allowed: bool,
+) -> Result<(), OpenAiError> {
+    let mut total_bytes = 0usize;
     for message in conversation.messages() {
-        if let Message::User(user) = message
-            && let Some(document) = user.documents().first()
-        {
-            return Err(OpenAiError::UnsupportedDocument {
-                provider: "OpenAI-compatible Chat Completions",
-                mime: document.mime().to_owned(),
-            });
+        if let Message::User(user) = message {
+            for document in user.documents() {
+                if !(pdf_allowed && document.mime() == "application/pdf") {
+                    return Err(OpenAiError::UnsupportedDocument {
+                        provider: "OpenAI-compatible Chat Completions",
+                        mime: document.mime().to_owned(),
+                    });
+                }
+                total_bytes = total_bytes.saturating_add(document.data().len());
+                if document.data().len() >= MAX_INLINE_DOCUMENT_BYTES
+                    || total_bytes > MAX_INLINE_DOCUMENT_BYTES
+                {
+                    return Err(OpenAiError::DocumentLimitExceeded {
+                        provider: "OpenAI-compatible Chat Completions",
+                        limit_bytes: MAX_INLINE_DOCUMENT_BYTES,
+                    });
+                }
+            }
         }
     }
     Ok(())
@@ -213,7 +239,7 @@ fn tool_result_content(result: &ToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kodkod_core::{Image, UserMessage};
+    use kodkod_core::{Document, Image, UserMessage};
     use serde_json::json;
 
     #[test]
@@ -232,7 +258,7 @@ mod tests {
             json!({"temp": 72}),
         )));
 
-        let request = build_request("gpt-4o", &conversation, &[]).unwrap();
+        let request = build_request("gpt-4o", &conversation, &[], false).unwrap();
         assert_eq!(request.model, "gpt-4o");
         assert_eq!(request.messages.len(), 4);
 
@@ -256,7 +282,7 @@ mod tests {
             UserMessage::new("what is this?").with_images(vec![Image::new("image/png", b"abc")]),
         );
 
-        let request = build_request("gpt-4o", &conversation, &[]).unwrap();
+        let request = build_request("gpt-4o", &conversation, &[], false).unwrap();
         let serialized = serde_json::to_value(&request).expect("request should serialize");
         let parts = &serialized["messages"][0]["content"];
 
@@ -268,6 +294,48 @@ mod tests {
                 .expect("url")
                 .starts_with("data:image/png;base64,")
         );
+    }
+
+    #[test]
+    fn serializes_pdf_as_a_chat_completion_file_part() {
+        let mut conversation = Conversation::new();
+        conversation.push_user_message(UserMessage::new("read this").with_documents(vec![
+            Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+        ]));
+
+        let request = build_request("gpt-4o", &conversation, &[], true).unwrap();
+        let serialized = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            serialized["messages"][0]["content"][1],
+            json!({
+                "type": "file",
+                "file": {
+                    "filename": "notes.pdf",
+                    "file_data": "data:application/pdf;base64,JVBERg=="
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_pdf_inputs_at_the_document_size_limit() {
+        let mut conversation = Conversation::new();
+        conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+            Document::try_new(
+                "application/pdf",
+                "large.pdf",
+                vec![0; MAX_INLINE_DOCUMENT_BYTES],
+            )
+            .unwrap(),
+        ]));
+
+        assert!(matches!(
+            validate_documents(&conversation, true),
+            Err(OpenAiError::DocumentLimitExceeded {
+                provider: "OpenAI-compatible Chat Completions",
+                limit_bytes: MAX_INLINE_DOCUMENT_BYTES,
+            })
+        ));
     }
 
     #[test]
@@ -292,7 +360,7 @@ mod tests {
                 .with_images(vec![Image::new("image/png", b"def")]),
         )));
 
-        let request = build_request("gpt-4o", &conversation, &[]).unwrap();
+        let request = build_request("gpt-4o", &conversation, &[], false).unwrap();
         let serialized = serde_json::to_value(request).unwrap();
         assert_eq!(serialized["messages"][0]["role"], "assistant");
         assert_eq!(serialized["messages"][1]["role"], "tool");

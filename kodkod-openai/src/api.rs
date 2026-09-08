@@ -42,11 +42,18 @@ pub(crate) enum UserContent {
 pub(crate) enum ContentPart {
     Text { text: String },
     ImageUrl { image_url: ImageUrl },
+    File { file: FileInput },
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ImageUrl {
     pub url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct FileInput {
+    pub filename: String,
+    pub file_data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

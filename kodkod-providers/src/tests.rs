@@ -171,6 +171,32 @@ fn catalog_routes_models_by_service_and_protocol() {
     for model in open_code_catalog() {
         assert!(seen.insert((model.service(), model.id())));
     }
+
+    assert!(
+        open_code_model(OpenCodeService::Go, "gpt-5.6-luna")
+            .unwrap()
+            .supports_pdf()
+    );
+    assert!(
+        open_code_model(OpenCodeService::Go, "glm-5.3-flash")
+            .unwrap()
+            .supports_pdf()
+    );
+    assert!(
+        open_code_model(OpenCodeService::Zen, "claude-sonnet-5")
+            .unwrap()
+            .supports_pdf()
+    );
+    assert!(
+        !open_code_model(OpenCodeService::Go, "grok-4.6")
+            .unwrap()
+            .supports_pdf()
+    );
+    assert!(
+        !open_code_model(OpenCodeService::Zen, "qwen3.7-max")
+            .unwrap()
+            .supports_pdf()
+    );
 }
 
 #[tokio::test]
@@ -294,7 +320,7 @@ async fn open_code_rejects_documents_before_http() {
         OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "session", "Lynx/1")
             .unwrap()
             .with_test_endpoint(server.uri());
-    let model = open_code_model(OpenCodeService::Go, "gpt-5.6-luna").unwrap();
+    let model = open_code_model(OpenCodeService::Go, "grok-4.6").unwrap();
     let mut conversation = Conversation::new();
     conversation.push_user_message(UserMessage::new("read").with_documents(vec![
         Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
@@ -316,6 +342,114 @@ async fn open_code_rejects_documents_before_http() {
         Err(ProviderError::Configuration(_))
     ));
     server.verify().await;
+}
+
+#[tokio::test]
+async fn open_code_routes_pdf_to_the_responses_protocol() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(completed("done")))
+        .mount(&server)
+        .await;
+    let provider =
+        OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "session", "Lynx/1")
+            .unwrap()
+            .with_test_endpoint(server.uri());
+    let model = open_code_model(OpenCodeService::Go, "gpt-5.6-luna").unwrap();
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+        Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+    ]));
+
+    provider
+        .complete_once(model, &conversation, &[])
+        .await
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["input"][0]["content"][1]["type"], "input_file");
+}
+
+#[tokio::test]
+async fn open_code_routes_pdf_to_the_chat_completions_protocol() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{ "message": { "content": "done" } }]
+        })))
+        .mount(&server)
+        .await;
+    let provider =
+        OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "session", "Lynx/1")
+            .unwrap()
+            .with_test_endpoint(server.uri());
+    let model = open_code_model(OpenCodeService::Go, "glm-5.3-flash").unwrap();
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+        Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+    ]));
+
+    provider
+        .complete_once(model, &conversation, &[])
+        .await
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["messages"][0]["content"][1]["type"], "file");
+}
+
+#[tokio::test]
+async fn open_code_routes_pdf_to_the_messages_protocol() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "done"}]
+        })))
+        .mount(&server)
+        .await;
+    let provider =
+        OpenCodeProvider::with_api_key(OpenCodeService::Zen, "secret", "session", "Lynx/1")
+            .unwrap()
+            .with_test_endpoint(server.uri());
+    let model = open_code_model(OpenCodeService::Zen, "claude-sonnet-5").unwrap();
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+        Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+    ]));
+
+    provider
+        .complete_once(model, &conversation, &[])
+        .await
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["messages"][0]["content"][0]["type"], "document");
+}
+
+#[tokio::test]
+async fn open_code_rejects_pdf_for_vision_models_without_a_pdf_capability() {
+    let provider =
+        OpenCodeProvider::with_api_key(OpenCodeService::Go, "secret", "session", "Lynx/1").unwrap();
+    let model = open_code_model(OpenCodeService::Go, "grok-4.6").unwrap();
+    let mut conversation = Conversation::new();
+    conversation.push_user_message(UserMessage::new("read").with_documents(vec![
+        Document::try_new("application/pdf", "notes.pdf", b"%PDF").unwrap(),
+    ]));
+
+    assert!(matches!(
+        provider.complete_once(model, &conversation, &[]).await,
+        Err(ProviderError::Configuration(_))
+    ));
+
+    let zen_provider =
+        OpenCodeProvider::with_api_key(OpenCodeService::Zen, "secret", "session", "Lynx/1")
+            .unwrap();
+    let qwen = open_code_model(OpenCodeService::Zen, "qwen3.7-max").unwrap();
+    assert!(!zen_provider.supports_document(qwen, "application/pdf"));
 }
 
 #[tokio::test]

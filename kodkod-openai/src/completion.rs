@@ -50,7 +50,28 @@ pub async fn complete_with_credentials(
     conversation: &Conversation,
     tools: &[ToolSpec],
 ) -> Result<AssistantMessage, OpenAiError> {
-    let request = build_request(model_id, conversation, tools)?;
+    complete_with_document_support(
+        client,
+        chat_completions_url,
+        credentials,
+        model_id,
+        conversation,
+        tools,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn complete_with_document_support(
+    client: &reqwest::Client,
+    chat_completions_url: &str,
+    credentials: Option<&RequestCredentials>,
+    model_id: &str,
+    conversation: &Conversation,
+    tools: &[ToolSpec],
+    pdf_allowed: bool,
+) -> Result<AssistantMessage, OpenAiError> {
+    let request = build_request(model_id, conversation, tools, pdf_allowed)?;
     let mut http_request = client.post(chat_completions_url).json(&request);
 
     if let Some(credentials) = credentials {
@@ -75,16 +96,22 @@ pub async fn complete_with_credentials(
     parse_assistant_message(body)
 }
 
-pub(crate) fn stream_with_credentials<'a>(
+pub(crate) fn stream_with_document_support<'a>(
     client: &'a reqwest::Client,
     chat_completions_url: &'a str,
     credentials: Option<&'a RequestCredentials>,
     model_id: &'a str,
     conversation: &'a Conversation,
     tools: &'a [ToolSpec],
+    pdf_allowed: bool,
 ) -> ProviderStream<'a, (), OpenAiError> {
     Box::pin(async_stream::try_stream! {
-        let mut request = serde_json::to_value(build_request(model_id, conversation, tools)?)?;
+        let mut request = serde_json::to_value(build_request(
+            model_id,
+            conversation,
+            tools,
+            pdf_allowed,
+        )?)?;
         request["stream"] = Value::Bool(true);
         let mut http_request = client.post(chat_completions_url).json(&request);
         if let Some(credentials) = credentials {

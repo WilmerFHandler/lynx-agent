@@ -60,6 +60,7 @@ def main():
                 "name": row[0],
                 "protocol": protocol,
                 "vision": "image" in model.get("modalities", {}).get("input", []),
+                "pdf": "pdf" in model.get("modalities", {}).get("input", []),
             })
     if not all(any(m["service"] == service for m in models)
                for service in ("go", "zen")):
